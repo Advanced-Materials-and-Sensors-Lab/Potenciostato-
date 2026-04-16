@@ -1,1 +1,0 @@
-Carpeta destinada a los códigos de la interfaz en Python
