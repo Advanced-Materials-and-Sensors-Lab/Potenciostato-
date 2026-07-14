@@ -139,7 +139,7 @@ Can be used for:
 
 # Citation
 
-If you use BioPot in your research, please cite:
+If you use in your research, please cite:
 
 ```
 E. Torres,
