@@ -99,26 +99,6 @@ The platform is optimized for high-impedance electrochemical sensors and support
 
 ---
 
-# Hardware
-
-## Main Components
-
-| Component | Function |
-|-----------|----------|
-| ESP32 | Main controller |
-| TL084 | Potential control loop |
-| AD620 | Differential WE–RE measurement |
-| Ag/AgCl | Reference electrode |
-| Graphite | Counter electrode |
-| PAN Membrane | Working electrode |
-| RC Filter | PWM smoothing |
-| Voltage Reference | ADC offset |
-| ±12 V Supply | Analog power |
-
-## Analog Front-End
-
-The analog front-end controls the electrochemical cell, maintains the desired potential, measures the WE–RE voltage, and conditions signals for the ESP32 ADC.
-
 ## Electrochemical Cell
 
 - Working Electrode (WE)
