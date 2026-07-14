@@ -2,6 +2,28 @@
 
 The ESP32 firmware acts as the main control unit of the potentiostat system. It manages PWM signal, electrochemical signal acquisition, data processing, and communication with the desktop/mobile applications.
 
+
+**Architecture**
+```cpp
+User Command
+      |
+      v
+ESP32 Firmware
+      |
+      +--> Generate Potential Waveform
+      |
+      +--> Control Potentiostat Circuit
+      |
+      +--> Acquire WE Signal
+      |
+      +--> Convert Voltage to Current
+      |
+      +--> Send Data
+      |
+      v
+Python HMI / Flutter App / ML Model
+```
+---
 ### Main Functions
 
 - **Potential waveform generation**
@@ -33,3 +55,4 @@ The ESP32 firmware acts as the main control unit of the potentiostat system. It 
 ```cpp
 VrefTIA = 0.91 V
 RfTIA = 10 kΩ
+
