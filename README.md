@@ -143,7 +143,7 @@ If you use in your research, please cite:
 
 ```
 E. Torres,
-BioPot: Open-Source Low-Cost Potentiostat Based on ESP32,
+Potenciostato: Open-Source Low-Cost Potentiostat Based on ESP32,
 GitHub Repository, 2026.
 ```
 
