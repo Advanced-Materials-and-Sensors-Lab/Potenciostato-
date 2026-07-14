@@ -126,8 +126,7 @@ Potenciostato/
 ├── Hardware/
 │     Schematics
 │     PCB
-│     BOM
-│
+│   
 ├── Python_GUI/
 │     Desktop Application
 │
