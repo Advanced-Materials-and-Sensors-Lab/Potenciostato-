@@ -164,9 +164,13 @@ def load_database() -> dict[str, Any]:
                 manifest = json.loads(storage_download(client, f"{route}/manifest.json").decode("utf-8"))
                 manifest["supabase_row_id"] = row.get("id")
                 manifest["storage_route"] = route
-                # Una celda se identifica por su nombre (CELDA-001, etc.).
-                # Si existen filas históricas duplicadas, se muestra una sola.
-                cells_by_name[str(manifest.get("id") or row.get("nombre"))] = manifest
+                # La tabla de Supabase es la fuente canónica para el nombre de la celda.
+                # Así un manifest histórico no puede ocultar otra celda por tener un ID repetido.
+                cell_name = str(row.get("nombre") or manifest.get("id") or "").strip()
+                if not cell_name:
+                    continue
+                manifest["id"] = cell_name
+                cells_by_name[cell_name] = manifest
             except Exception:
                 # Un archivo dañado no impide mostrar el resto de celdas.
                 continue
@@ -661,13 +665,26 @@ def add_roi_feature_marker(fig, record, color, label):
     feature = analyze_roi_feature(record)
     if feature.get("tipo") not in ("pico", "meseta"):
         return
-    symbol = "diamond" if feature["tipo"] == "pico" else "square"
+
+    # Los rasgos se marcan de forma discreta y abierta para no crear
+    # cuadros sólidos en la gráfica ni elementos redundantes en la leyenda.
+    symbol = "diamond-open" if feature["tipo"] == "pico" else "square-open"
     fig.add_trace(go.Scatter(
-        x=[feature["vset_centro_V"]], y=[feature["corriente_uA"]], mode="markers",
-        marker=dict(size=10, symbol=symbol, color=color, line=dict(color="white", width=1.5)),
+        x=[feature["vset_centro_V"]],
+        y=[feature["corriente_uA"]],
+        mode="markers",
+        marker=dict(
+            size=11,
+            symbol=symbol,
+            color=color,
+            line=dict(color=color, width=2),
+        ),
         name=f"{feature['tipo'].capitalize()} {label}",
-        hovertemplate=(f"{feature['tipo'].capitalize()} {label}<br>Vset: %{{x:.3f}} V"
-                       f"<br>Corriente: %{{y:.3g}} uA<br>Ancho/extensión: {feature['ancho_V']:.3f} V<extra></extra>"),
+        showlegend=False,
+        hovertemplate=(
+            f"{feature['tipo'].capitalize()} {label}<br>Vset: %{{x:.3f}} V"
+            f"<br>Corriente: %{{y:.3g}} uA<br>Ancho/extensión: {feature['ancho_V']:.3f} V<extra></extra>"
+        ),
     ))
 
 
@@ -735,7 +752,216 @@ def make_lsv_mean_figure(records):
         fig.add_vline(x=float(grid[peak]), line_dash="dash", line_color="#EF6B6B", annotation_text=f"Máximo ROI {grid[peak]:.3f} V")
     fig.add_vrect(x0=ROI_VSET_MIN, x1=ROI_VSET_MAX, fillcolor="#F5B400", opacity=0.08, line_width=0)
     return base_layout(fig, "Vset (V)", "Corriente filtrada (uA)")
+def make_general_evolution_figure(records):
+    """
+    Superpone la evolución voltamétrica general de la celda
+    únicamente entre Vset = 0.0 y 0.6 V.
 
+    Incluye:
+    - CV Blanco
+    - CV con Cu²+
+    - LSV 1
+    - LSV 2
+    - LSV 3
+    - Promedio de las LSV
+
+    CA no se incluye porque se analiza contra tiempo.
+    """
+    fig = go.Figure()
+
+    VMIN = 0.0
+    VMAX = 0.6
+
+    def add_record_segments(record, name, color, dash="solid", width=2.0):
+        if not record:
+            return
+
+        x = np.asarray(record.get("x", []), dtype=float)
+        y = record_signal(record)
+
+        size = min(len(x), len(y))
+        x = x[:size]
+        y = y[:size]
+
+        valid = (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & (x >= VMIN)
+            & (x <= VMAX)
+        )
+
+        indices = np.where(valid)[0]
+        if not len(indices):
+            return
+
+        # Evita unir artificialmente ramas distintas del CV.
+        groups = np.split(
+            indices,
+            np.where(np.diff(indices) > 1)[0] + 1
+        )
+
+        first = True
+
+        for group in groups:
+            if len(group) < 3:
+                continue
+
+            fig.add_trace(go.Scatter(
+                x=x[group],
+                y=y[group],
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=first,
+                line=dict(
+                    color=color,
+                    width=width,
+                    dash=dash,
+                ),
+                hovertemplate=(
+                    f"{name}"
+                    "<br>Vset: %{x:.3f} V"
+                    "<br>Corriente: %{y:.3g} uA"
+                    "<extra></extra>"
+                ),
+            ))
+
+            first = False
+
+    # ---------------------------------------------------------
+    # CV
+    # ---------------------------------------------------------
+    cv_blank = get_record(records, "CV", "blanco")
+    cv_cu = get_record(records, "CV", "cobre")
+
+    add_record_segments(
+        cv_blank,
+        "CV Blanco",
+        BLUE,
+        "solid",
+        2.4,
+    )
+
+    add_record_segments(
+        cv_cu,
+        "CV Cu²⁺",
+        YELLOW,
+        "solid",
+        2.4,
+    )
+
+    # ---------------------------------------------------------
+    # LSV individuales
+    # ---------------------------------------------------------
+    lsv_definitions = [
+        (1, "#334155", "solid"),
+        (2, BLUE_2, "dash"),
+        (3, "#64748B", "dot"),
+    ]
+
+    lsv_records = []
+
+    for rep, color, dash in lsv_definitions:
+        record = get_record(records, "LSV", "cobre", rep)
+
+        if record:
+            lsv_records.append(record)
+
+        add_record_segments(
+            record,
+            f"LSV {rep}",
+            color,
+            dash,
+            1.8,
+        )
+
+    # ---------------------------------------------------------
+    # Promedio LSV
+    # ---------------------------------------------------------
+    if len(lsv_records) >= 2:
+
+        grid = np.linspace(VMIN, VMAX, 250)
+        aligned = []
+
+        for record in lsv_records:
+            x = np.asarray(record.get("x", []), dtype=float)
+            y = record_signal(record)
+
+            size = min(len(x), len(y))
+            x = x[:size]
+            y = y[:size]
+
+            valid = np.isfinite(x) & np.isfinite(y)
+
+            x = x[valid]
+            y = y[valid]
+
+            order = np.argsort(x)
+            x = x[order]
+            y = y[order]
+
+            # Evita problemas de interpolación por Vset repetido.
+            x_unique, unique_idx = np.unique(x, return_index=True)
+            y_unique = y[unique_idx]
+
+            if len(x_unique) >= 2:
+                aligned.append(
+                    np.interp(grid, x_unique, y_unique)
+                )
+
+        if len(aligned) >= 2:
+            mean_lsv = np.nanmean(
+                np.vstack(aligned),
+                axis=0
+            )
+
+            fig.add_trace(go.Scatter(
+                x=grid,
+                y=mean_lsv,
+                mode="lines",
+                name="Promedio LSV",
+                line=dict(
+                    color="#111111",
+                    width=3.2,
+                ),
+                hovertemplate=(
+                    "Promedio LSV"
+                    "<br>Vset: %{x:.3f} V"
+                    "<br>Corriente: %{y:.3g} uA"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig = base_layout(
+        fig,
+        "Vset (V)",
+        "Corriente filtrada (uA)",
+    )
+
+    fig.update_xaxes(
+        range=[VMIN, VMAX],
+        dtick=0.1,
+    )
+
+    fig.update_layout(
+        height=330,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=9),
+        ),
+        margin=dict(
+            l=55,
+            r=20,
+            t=65,
+            b=50,
+        ),
+    )
+
+    return fig
 
 # -----------------------------------------------------------------------------
 # UI helpers
@@ -2371,13 +2597,56 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
         except (TypeError, ValueError):
             return "N/D"
 
+    def pdf_markup(value):
+        """Texto seguro para Paragraph y notación Cu2+ sin glifos cuadrados."""
+        from xml.sax.saxutils import escape
+
+        text = escape(str(value))
+        # Helvetica no siempre contiene el glifo Unicode de superíndice +.
+        # ReportLab sí puede representar la carga con la etiqueta <super>.
+        text = text.replace("Cu²⁺", "Cu<super>2+</super>")
+        text = text.replace("Cu²+", "Cu<super>2+</super>")
+        return text
+
+    def pdf_paragraph(value, style=None):
+        return Paragraph(pdf_markup(value), style or styles["BodySmall"])
+
     logo_path = ASSETS / "sensa_logo_header.png"
     if logo_path.exists():
         story.append(Image(str(logo_path), width=5.2*cm, height=3.15*cm))
     story.append(Paragraph("Informe electroquímico SENSA Cells", styles["SensaTitle"]))
     conc = composition.get("final_copper_ppm")
-    story.append(Paragraph(f"Celda: {current_cell or 'Sin identificar'} &nbsp;&nbsp; | &nbsp;&nbsp; Concentración Cu²⁺: {conc if conc is not None else 'No detectada'} ppm", styles["BodySmall"]))
-    story.append(Paragraph(f"Investigador: {researcher} &nbsp;&nbsp; | &nbsp;&nbsp; Fecha del ensayo: {period['date']} &nbsp;&nbsp; | &nbsp;&nbsp; Hora: {period['time']}", styles["BodySmall"]))
+
+    header_data = [
+        [
+            Paragraph("<b>Celda</b>", styles["BodySmall"]),
+            Paragraph("<b>Cu<super>2+</super> final</b>", styles["BodySmall"]),
+            Paragraph("<b>Investigador</b>", styles["BodySmall"]),
+            Paragraph("<b>Fecha y hora del ensayo</b>", styles["BodySmall"]),
+        ],
+        [
+            pdf_paragraph(current_cell or "Sin identificar"),
+            Paragraph(
+                f"{display_number(conc) if conc is not None else 'No detectada'} ppm",
+                styles["BodySmall"],
+            ),
+            pdf_paragraph(researcher),
+            pdf_paragraph(f"{period['date']} | {period['time']}"),
+        ],
+    ]
+    header_table = Table(header_data, colWidths=[3.0*cm, 3.0*cm, 4.0*cm, 5.0*cm])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EAF2FB")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor(BLUE)),
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(header_table)
     story.append(Spacer(1, 8))
     story.append(Paragraph("Unidades y composición de la celda", styles["Section"]))
     composition_data = [
@@ -2402,10 +2671,35 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     ]))
     story.append(composition_table)
     story.append(Spacer(1, 8))
-    story.append(Paragraph("Objetivo", styles["Section"]))
-    story.append(Paragraph("Documentar la evolución de la celda desde el blanco hasta la respuesta después de añadir cobre, comparando CA, CV y tres LSV consecutivas con métricas trazables.", styles["BodySmall"]))
-    story.append(Paragraph("Alcance", styles["Section"]))
-    story.append(Paragraph("El informe diferencia resultados observados de interpretaciones electroquímicas. Para CV y LSV, los máximos, amplitudes y repetibilidad se calculan exclusivamente en la región Vset de 0.2 a 0.6 V; el CA se analiza contra tiempo.", styles["BodySmall"]))
+    objective_scope_data = [
+        [
+            Paragraph("<b>Objetivo</b>", styles["BodySmall"]),
+            pdf_paragraph(
+                "Documentar la evolución de la celda desde el blanco hasta la respuesta "
+                "después de añadir cobre, comparando CA, CV y tres LSV consecutivas con métricas trazables."
+            ),
+        ],
+        [
+            Paragraph("<b>Alcance</b>", styles["BodySmall"]),
+            pdf_paragraph(
+                "El informe diferencia resultados observados de interpretaciones electroquímicas. "
+                "Para CV y LSV, las métricas analíticas se calculan en Vset = 0.2–0.6 V; "
+                "la CA se analiza contra tiempo."
+            ),
+        ],
+    ]
+    objective_scope_table = Table(objective_scope_data, colWidths=[3.2*cm, 11.8*cm])
+    objective_scope_table.setStyle(TableStyle([
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(objective_scope_table)
 
     states = protocol_state(records or [])
     data = [["Archivo", "Técnica", "Condición", "Puntos", "Filtro"]]
@@ -2427,7 +2721,10 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     story.append(table)
     story.append(Spacer(1, 10))
     story.append(Paragraph("Control del protocolo", styles["Section"]))
-    protocol_data = [["Etapa", "Estado"]] + [[label, "Completa" if ok else "Faltante"] for label, _, ok in states]
+    protocol_data = [["Etapa", "Estado"]] + [
+        [pdf_paragraph(label), pdf_paragraph("Completa" if ok else "Faltante")]
+        for label, _, ok in states
+    ]
     protocol_table = Table(protocol_data, colWidths=[11*cm, 4*cm])
     protocol_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .4, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 8.5)]))
     story.append(protocol_table)
@@ -2443,6 +2740,18 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
         chart_sections.append(("4. Voltametrías de barrido lineal", lsv_fig))
     if lsv_count >= 2:
         chart_sections.append(("5. Promedio y repetibilidad de las LSV", make_lsv_mean_figure(records or []).to_dict()))
+    if any(
+    record.get("technique") in ("CV", "LSV")
+    for record in (records or [])
+    ):
+        chart_sections.append(
+            (
+                "6. Evolución general de la celda — Vset 0,0 a 0,6 V",
+                 make_general_evolution_figure(
+                      records or []
+                 ).to_dict()
+            )
+        )
     for title, fig_dict in chart_sections:
         story.append(Spacer(1, 8))
         story.append(Paragraph(title, styles["Section"]))
@@ -2450,9 +2759,58 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
             fig = go.Figure(fig_dict)
             png = fig.to_image(format="png", width=950, height=410, scale=1.2)
             img_buf = io.BytesIO(png)
-            story.append(Image(img_buf, width=15.9*cm, height=6.45*cm))
-        except Exception:
-            story.append(Paragraph("La gráfica no pudo incorporarse. Instala o actualiza Kaleido para exportar figuras Plotly.", styles["BodySmall"]))
+            chart_image = Image(img_buf, width=15.5*cm, height=6.25*cm)
+            chart_box = Table([[chart_image]], colWidths=[16.1*cm])
+            chart_box.setStyle(TableStyle([
+                ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#CBD5E1")),
+                ("BACKGROUND", (0,0), (-1,-1), colors.white),
+                ("LEFTPADDING", (0,0), (-1,-1), 8),
+                ("RIGHTPADDING", (0,0), (-1,-1), 8),
+                ("TOPPADDING", (0,0), (-1,-1), 8),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ]))
+            story.append(chart_box)
+
+            if "Evolución general" in title:
+                evolution_data = [
+                    [Paragraph("<b>Ventana comparada</b>", styles["BodySmall"]), pdf_paragraph("Vset 0.0–0.6 V")],
+                    [
+                        Paragraph("<b>Señales incluidas</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "CV Blanco, CV Cu<super>2+</super>, LSV 1, LSV 2, LSV 3 y promedio LSV",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                    [Paragraph("<b>Señal no incluida</b>", styles["BodySmall"]), pdf_paragraph("CA, porque se interpreta contra tiempo (s).")],
+                    [
+                        Paragraph("<b>Objetivo de la figura</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "Comparar en una misma ventana la evolución voltamétrica desde el blanco "
+                            "hasta los barridos consecutivos posteriores a la adición de Cu<super>2+</super>.",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                ]
+                evolution_table = Table(evolution_data, colWidths=[4.1*cm, 12.0*cm])
+                evolution_table.setStyle(TableStyle([
+                    ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+                    ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+                    ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 7),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 7),
+                    ("TOPPADDING", (0,0), (-1,-1), 6),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+                ]))
+                story.append(Spacer(1, 6))
+                story.append(evolution_table)
+
+        except Exception as exc:
+            story.append(Paragraph(
+                "La gráfica no pudo incorporarse. Verifica Kaleido/Chrome en Render. "
+                f"Detalle técnico: {pdf_markup(exc)}",
+                styles["BodySmall"],
+            ))
 
         relevant = []
         title_lower = title.lower()
@@ -2476,15 +2834,15 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
         line = raw_line.strip()
         if not line:
             story.append(Spacer(1, 4)); continue
-        clean = line.replace("**", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        if clean.startswith("###"):
-            story.append(Paragraph(clean.lstrip("# "), styles["Section"]))
-        elif clean.startswith("##"):
+        clean_raw = line.replace("**", "")
+        if clean_raw.startswith("###"):
+            story.append(Paragraph(pdf_markup(clean_raw.lstrip("# ")), styles["Section"]))
+        elif clean_raw.startswith("##"):
             continue
-        elif clean.startswith("- "):
-            story.append(Paragraph("• " + clean[2:], styles["BodySmall"]))
+        elif clean_raw.startswith("- "):
+            story.append(Paragraph("• " + pdf_markup(clean_raw[2:]), styles["BodySmall"]))
         else:
-            story.append(Paragraph(clean, styles["BodySmall"]))
+            story.append(Paragraph(pdf_markup(clean_raw), styles["BodySmall"]))
 
     doc.build(story)
     buffer.seek(0)
