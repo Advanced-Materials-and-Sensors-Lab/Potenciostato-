@@ -1,0 +1,10 @@
+dash>=3.2
+plotly>=6.3
+pandas>=2.2
+numpy>=2.0
+reportlab>=4.2
+kaleido>=1.0
+openai>=1.99
+python-dotenv>=1.0
+supabase>=2.18
+gunicorn>=23.0
