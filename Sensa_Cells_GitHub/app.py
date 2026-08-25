@@ -822,6 +822,12 @@ INITIAL_CELL_ID = INITIAL_CELL.get("id") if INITIAL_CELL else None
 app.layout = html.Div(className="app-shell", children=[
     dcc.Store(id="records-store", data=INITIAL_RECORDS),
     dcc.Store(id="database-store", data=INITIAL_DATABASE),
+    dcc.Interval(
+    id="reload-database-on-start",
+    interval=800,
+    n_intervals=0,
+    max_intervals=1,
+    ),
     dcc.Store(id="current-cell-store", data=INITIAL_CELL_ID),
     dcc.Store(id="report-ready-store", data=bool(INITIAL_CELL and INITIAL_CELL.get("report_generated"))),
     dcc.Store(id="draft-mode-store", data=False),
@@ -1157,7 +1163,16 @@ def calculate_cell_composition(electrolyte, electrolyte_concentration, electroly
         f"Volumen final: {final_volume:g} mL | Cu final estimado: {final_copper:.3g} ppm."
     )
     return round(final_copper, 6), text
+@app.callback(
+    Output("database-store", "data", allow_duplicate=True),
+    Input("reload-database-on-start", "n_intervals"),
+    prevent_initial_call=True,
+)
+def reload_database_on_start(n_intervals):
+    if not n_intervals:
+        return no_update
 
+    return load_database()
 
 @app.callback(
     Output("database-store", "data", allow_duplicate=True),
@@ -1169,6 +1184,7 @@ def calculate_cell_composition(electrolyte, electrolyte_concentration, electroly
     State("database-store", "data"),
     prevent_initial_call=True,
 )
+
 def add_researcher(n_clicks, name, database):
     clean_name = " ".join(str(name or "").split())
     database = database or load_database()
