@@ -1,8 +1,6 @@
 <div align="center">
 
-# SENSA
-
-<img src="assets/icono.png" width="180">
+<img src="assets/sensa_logo_header.png" width="180">
 
 
 ### Smart Environmental Nanofiber Sensing Architecture
