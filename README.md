@@ -1,20 +1,21 @@
+<div align="center">
+
 # Potenciostato
+
+<img src="assets/logo.png" width="180">
+
 # SENSA
-# Smart Enviromental Nanofiber Sensing Architecture
 
-## Open-Source ESP32-Based Potentiostat with Desktop Software, Mobile App and Machine Learning for Electrochemical Analysis
+### Smart Environmental Nanofiber Sensing Architecture
 
-> **An integrated electrochemical platform combining custom hardware, ESP32 firmware, a Python desktop application, a Flutter mobile application, and Machine Learning for electrochemical sensing.**
+[![ESP32](https://img.shields.io/badge/ESP32-32-blue?logo=espressif)](https://www.espressif.com/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Research-orange.svg)]()
 
----
-<p align="center">
+**Plataforma inteligente para la detección y monitoreo de contaminantes ambientales mediante un potenciostato portátil, sensores basados en nanofibras y análisis de datos con aprendizaje automático.**
 
-![ESP32](https://img.shields.io/badge/ESP32-Microcontroller-red)
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/Status-Research-orange)
-
-</p>
+</div>
 ## Overview
 
 This repository contains the complete development of an open-source potentiostat designed for electrochemical sensing applications.
