@@ -963,6 +963,167 @@ def make_general_evolution_figure(records):
 
     return fig
 
+
+
+def make_pdf_chart_png(records, chart_kind: str) -> io.BytesIO:
+    """Genera las figuras estáticas del informe con Matplotlib, sin Kaleido/Chrome."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    records = records or []
+    fig, ax = plt.subplots(figsize=(9.5, 4.1), dpi=140)
+
+    def finish(xlabel: str, ylabel: str, xlim=None):
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        ax.grid(True, alpha=0.22, linewidth=0.7)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.16),
+                ncol=min(4, max(1, len(labels))),
+                frameon=False,
+                fontsize=8,
+            )
+        fig.tight_layout(rect=[0, 0, 1, 0.91])
+        image = io.BytesIO()
+        fig.savefig(image, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        image.seek(0)
+        return image
+
+    def plot_record(record, label, color, linestyle="-", linewidth=1.8, mask=None):
+        if not record:
+            return
+        x = np.asarray(record.get("x", []), dtype=float)
+        y = record_signal(record)
+        size = min(len(x), len(y))
+        x, y = x[:size], y[:size]
+        valid = np.isfinite(x) & np.isfinite(y)
+        if mask is not None:
+            valid &= mask(x)
+        indices = np.where(valid)[0]
+        if not len(indices):
+            return
+        groups = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        first = True
+        for group in groups:
+            if len(group) < 2:
+                continue
+            ax.plot(
+                x[group],
+                y[group],
+                label=label if first else None,
+                color=color,
+                linestyle=linestyle,
+                linewidth=linewidth,
+            )
+            first = False
+
+    if chart_kind == "ca":
+        plot_record(get_record(records, "CA", "blanco"), "CA Blanco filtrado", BLUE, "-", 2.0)
+        plot_record(get_record(records, "CA", "cobre"), "CA Cu²⁺ filtrado", YELLOW, "-", 2.0)
+        return finish("Tiempo (s)", "Corriente filtrada (uA)")
+
+    if chart_kind == "cv":
+        plot_record(get_record(records, "CV", "blanco"), "CV Blanco filtrado", BLUE, "-", 2.0)
+        plot_record(get_record(records, "CV", "cobre"), "CV Cu²⁺ filtrado", YELLOW, "-", 2.0)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "lsv":
+        definitions = [
+            (1, YELLOW, "-"),
+            (2, "#334155", "-"),
+            (3, BLUE_2, "--"),
+        ]
+        for rep, color, linestyle in definitions:
+            plot_record(get_record(records, "LSV", "cobre", rep), f"LSV {rep} filtrada", color, linestyle, 1.9)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "lsv_mean":
+        curves = [get_record(records, "LSV", "cobre", rep) for rep in (1, 2, 3)]
+        curves = [curve for curve in curves if curve]
+        if curves:
+            xmin = max(min(curve["x"]) for curve in curves)
+            xmax = min(max(curve["x"]) for curve in curves)
+            grid = np.linspace(xmin, xmax, 300)
+            aligned = []
+            for curve in curves:
+                x = np.asarray(curve["x"], dtype=float)
+                y = record_signal(curve)
+                size = min(len(x), len(y))
+                x, y = x[:size], y[:size]
+                valid = np.isfinite(x) & np.isfinite(y)
+                x, y = x[valid], y[valid]
+                order = np.argsort(x)
+                x, y = x[order], y[order]
+                x_unique, unique_idx = np.unique(x, return_index=True)
+                y_unique = y[unique_idx]
+                if len(x_unique) >= 2:
+                    aligned.append(np.interp(grid, x_unique, y_unique))
+            if aligned:
+                matrix = np.vstack(aligned)
+                mean = np.nanmean(matrix, axis=0)
+                std = np.nanstd(matrix, axis=0)
+                ax.fill_between(grid, mean - std, mean + std, alpha=0.20, label="± 1 DE")
+                ax.plot(grid, mean, color="#111111", linewidth=2.4, label="Promedio LSV")
+                roi_indices = np.where((grid >= ROI_VSET_MIN) & (grid <= ROI_VSET_MAX))[0]
+                if len(roi_indices):
+                    peak = int(roi_indices[np.nanargmax(mean[roi_indices])])
+                    ax.axvline(float(grid[peak]), linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "general":
+        vmin, vmax = 0.0, 0.6
+        roi_mask = lambda x: (x >= vmin) & (x <= vmax)
+        plot_record(get_record(records, "CV", "blanco"), "CV Blanco", BLUE, "-", 2.0, roi_mask)
+        plot_record(get_record(records, "CV", "cobre"), "CV Cu²⁺", YELLOW, "-", 2.0, roi_mask)
+
+        definitions = [
+            (1, "#334155", "-"),
+            (2, BLUE_2, "--"),
+            (3, "#64748B", ":"),
+        ]
+        lsv_records = []
+        for rep, color, linestyle in definitions:
+            record = get_record(records, "LSV", "cobre", rep)
+            if record:
+                lsv_records.append(record)
+            plot_record(record, f"LSV {rep}", color, linestyle, 1.6, roi_mask)
+
+        if len(lsv_records) >= 2:
+            grid = np.linspace(vmin, vmax, 250)
+            aligned = []
+            for record in lsv_records:
+                x = np.asarray(record.get("x", []), dtype=float)
+                y = record_signal(record)
+                size = min(len(x), len(y))
+                x, y = x[:size], y[:size]
+                valid = np.isfinite(x) & np.isfinite(y)
+                x, y = x[valid], y[valid]
+                order = np.argsort(x)
+                x, y = x[order], y[order]
+                x_unique, unique_idx = np.unique(x, return_index=True)
+                y_unique = y[unique_idx]
+                if len(x_unique) >= 2:
+                    aligned.append(np.interp(grid, x_unique, y_unique))
+            if len(aligned) >= 2:
+                mean = np.nanmean(np.vstack(aligned), axis=0)
+                ax.plot(grid, mean, color="#111111", linewidth=2.5, label="Promedio LSV")
+
+        ax.set_xticks(np.arange(0.0, 0.61, 0.1))
+        return finish("Vset (V)", "Corriente filtrada (uA)", (vmin, vmax))
+
+    plt.close(fig)
+    raise ValueError(f"Tipo de gráfica PDF no reconocido: {chart_kind}")
+
 # -----------------------------------------------------------------------------
 # UI helpers
 # -----------------------------------------------------------------------------
@@ -2729,131 +2890,4 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     protocol_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .4, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 8.5)]))
     story.append(protocol_table)
 
-    # El PDF incorpora únicamente las técnicas que existen en la celda.
-    chart_sections = []
-    if any(record.get("technique") == "CA" for record in (records or [])):
-        chart_sections.append(("2. Evolución de las cronoamperometrías", ca_fig))
-    if any(record.get("technique") == "CV" for record in (records or [])):
-        chart_sections.append(("3. Evolución de las voltametrías cíclicas", cv_fig))
-    lsv_count = sum(record.get("technique") == "LSV" for record in (records or []))
-    if lsv_count:
-        chart_sections.append(("4. Voltametrías de barrido lineal", lsv_fig))
-    if lsv_count >= 2:
-        chart_sections.append(("5. Promedio y repetibilidad de las LSV", make_lsv_mean_figure(records or []).to_dict()))
-    if any(
-    record.get("technique") in ("CV", "LSV")
-    for record in (records or [])
-    ):
-        chart_sections.append(
-            (
-                "6. Evolución general de la celda — Vset 0,0 a 0,6 V",
-                 make_general_evolution_figure(
-                      records or []
-                 ).to_dict()
-            )
-        )
-    for title, fig_dict in chart_sections:
-        story.append(Spacer(1, 8))
-        story.append(Paragraph(title, styles["Section"]))
-        try:
-            fig = go.Figure(fig_dict)
-            png = fig.to_image(format="png", width=950, height=410, scale=1.2)
-            img_buf = io.BytesIO(png)
-            chart_image = Image(img_buf, width=15.5*cm, height=6.25*cm)
-            chart_box = Table([[chart_image]], colWidths=[16.1*cm])
-            chart_box.setStyle(TableStyle([
-                ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#CBD5E1")),
-                ("BACKGROUND", (0,0), (-1,-1), colors.white),
-                ("LEFTPADDING", (0,0), (-1,-1), 8),
-                ("RIGHTPADDING", (0,0), (-1,-1), 8),
-                ("TOPPADDING", (0,0), (-1,-1), 8),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ]))
-            story.append(chart_box)
-
-            if "Evolución general" in title:
-                evolution_data = [
-                    [Paragraph("<b>Ventana comparada</b>", styles["BodySmall"]), pdf_paragraph("Vset 0.0–0.6 V")],
-                    [
-                        Paragraph("<b>Señales incluidas</b>", styles["BodySmall"]),
-                        Paragraph(
-                            "CV Blanco, CV Cu<super>2+</super>, LSV 1, LSV 2, LSV 3 y promedio LSV",
-                            styles["BodySmall"],
-                        ),
-                    ],
-                    [Paragraph("<b>Señal no incluida</b>", styles["BodySmall"]), pdf_paragraph("CA, porque se interpreta contra tiempo (s).")],
-                    [
-                        Paragraph("<b>Objetivo de la figura</b>", styles["BodySmall"]),
-                        Paragraph(
-                            "Comparar en una misma ventana la evolución voltamétrica desde el blanco "
-                            "hasta los barridos consecutivos posteriores a la adición de Cu<super>2+</super>.",
-                            styles["BodySmall"],
-                        ),
-                    ],
-                ]
-                evolution_table = Table(evolution_data, colWidths=[4.1*cm, 12.0*cm])
-                evolution_table.setStyle(TableStyle([
-                    ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
-                    ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
-                    ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
-                    ("VALIGN", (0,0), (-1,-1), "TOP"),
-                    ("LEFTPADDING", (0,0), (-1,-1), 7),
-                    ("RIGHTPADDING", (0,0), (-1,-1), 7),
-                    ("TOPPADDING", (0,0), (-1,-1), 6),
-                    ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-                ]))
-                story.append(Spacer(1, 6))
-                story.append(evolution_table)
-
-        except Exception as exc:
-            story.append(Paragraph(
-                "La gráfica no pudo incorporarse. Verifica Kaleido/Chrome en Render. "
-                f"Detalle técnico: {pdf_markup(exc)}",
-                styles["BodySmall"],
-            ))
-
-        relevant = []
-        title_lower = title.lower()
-        for item in calculate_metrics(records or []):
-            if ("crono" in title_lower and item["técnica"] == "CA") or ("cíclica" in title_lower and item["técnica"] == "CV") or ("lsv" in title_lower and item["técnica"] == "LSV"):
-                relevant.append(item)
-        if relevant:
-            metric_data = [["Archivo", "Mínimo (uA)", "Máximo (uA)", "Media (uA)", "DE (uA)"]] + [[item["archivo"], f"{item['i_min']:.3g}", f"{item['i_max']:.3g}", f"{item['i_media']:.3g}", f"{item['i_std']:.3g}"] for item in relevant]
-            metric_table = Table(metric_data, colWidths=[7.3*cm, 2.1*cm, 2.1*cm, 2.1*cm, 2.1*cm])
-            metric_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .35, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 7.7), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")])]))
-            story.append(Spacer(1, 8)); story.append(metric_table)
-
-    # El PDF utiliza el mismo análisis mostrado en pantalla, generado por Gemini
-    # y almacenado en analysis-store. El análisis local se conserva únicamente
-    # como respaldo si todavía no existe una respuesta de IA.
-    if not analysis_text or not str(analysis_text).strip():
-        analysis_text, _ = local_analysis(records or [], composition, researcher)
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("Análisis electroquímico", styles["Section"]))
-    for raw_line in str(analysis_text).splitlines():
-        line = raw_line.strip()
-        if not line:
-            story.append(Spacer(1, 4)); continue
-        clean_raw = line.replace("**", "")
-        if clean_raw.startswith("###"):
-            story.append(Paragraph(pdf_markup(clean_raw.lstrip("# ")), styles["Section"]))
-        elif clean_raw.startswith("##"):
-            continue
-        elif clean_raw.startswith("- "):
-            story.append(Paragraph("• " + pdf_markup(clean_raw[2:]), styles["BodySmall"]))
-        else:
-            story.append(Paragraph(pdf_markup(clean_raw), styles["BodySmall"]))
-
-    doc.build(story)
-    buffer.seek(0)
-    filename = f"SENSA_Informe_{current_cell or 'Celda'}.pdf"
-    pdf_bytes = buffer.getvalue()
-    return dcc.send_bytes(pdf_bytes, filename), True, base64.b64encode(pdf_bytes).decode("ascii")
-
-
-if __name__ == "__main__":
-    app.run(
-        debug=os.getenv("DASH_DEBUG", "false").lower() == "true",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8050")),
-    )
+    # Las gráficas del PDF se generan con Matplotlib.
