@@ -2891,3 +2891,136 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     story.append(protocol_table)
 
     # Las gráficas del PDF se generan con Matplotlib.
+    # Plotly se conserva únicamente para la interfaz web interactiva.
+    # De esta forma el informe no depende de Kaleido ni de Chrome en Render.
+    chart_sections = []
+    if any(record.get("technique") == "CA" for record in (records or [])):
+        chart_sections.append(("2. Evolución de las cronoamperometrías", "ca"))
+    if any(record.get("technique") == "CV" for record in (records or [])):
+        chart_sections.append(("3. Evolución de las voltametrías cíclicas", "cv"))
+    lsv_count = sum(record.get("technique") == "LSV" for record in (records or []))
+    if lsv_count:
+        chart_sections.append(("4. Voltametrías de barrido lineal", "lsv"))
+    if lsv_count >= 2:
+        chart_sections.append(("5. Promedio y repetibilidad de las LSV", "lsv_mean"))
+    if any(record.get("technique") in ("CV", "LSV") for record in (records or [])):
+        chart_sections.append(("6. Evolución general de la celda — Vset 0,0 a 0,6 V", "general"))
+
+    for title, chart_kind in chart_sections:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(title, styles["Section"]))
+        try:
+            img_buf = make_pdf_chart_png(records or [], chart_kind)
+            chart_image = Image(img_buf, width=15.5*cm, height=6.25*cm)
+            chart_box = Table([[chart_image]], colWidths=[16.1*cm])
+            chart_box.setStyle(TableStyle([
+                ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#CBD5E1")),
+                ("BACKGROUND", (0,0), (-1,-1), colors.white),
+                ("LEFTPADDING", (0,0), (-1,-1), 8),
+                ("RIGHTPADDING", (0,0), (-1,-1), 8),
+                ("TOPPADDING", (0,0), (-1,-1), 8),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ]))
+            story.append(chart_box)
+
+            if chart_kind == "general":
+                evolution_data = [
+                    [Paragraph("<b>Ventana comparada</b>", styles["BodySmall"]), pdf_paragraph("Vset 0.0–0.6 V")],
+                    [
+                        Paragraph("<b>Señales incluidas</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "CV Blanco, CV Cu<super>2+</super>, LSV 1, LSV 2, LSV 3 y promedio LSV",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                    [Paragraph("<b>Señal no incluida</b>", styles["BodySmall"]), pdf_paragraph("CA, porque se interpreta contra tiempo (s).")],
+                    [
+                        Paragraph("<b>Objetivo de la figura</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "Comparar en una misma ventana la evolución voltamétrica desde el blanco "
+                            "hasta los barridos consecutivos posteriores a la adición de Cu<super>2+</super>.",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                ]
+                evolution_table = Table(evolution_data, colWidths=[4.1*cm, 12.0*cm])
+                evolution_table.setStyle(TableStyle([
+                    ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+                    ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+                    ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 7),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 7),
+                    ("TOPPADDING", (0,0), (-1,-1), 6),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+                ]))
+                story.append(Spacer(1, 6))
+                story.append(evolution_table)
+
+        except Exception as exc:
+            story.append(Paragraph(
+                "La gráfica no pudo incorporarse con Matplotlib. "
+                f"Detalle técnico: {pdf_markup(exc)}",
+                styles["BodySmall"],
+            ))
+
+        relevant = []
+        title_lower = title.lower()
+        for item in calculate_metrics(records or []):
+            if ("crono" in title_lower and item["técnica"] == "CA") or ("cíclica" in title_lower and item["técnica"] == "CV") or ("lsv" in title_lower and item["técnica"] == "LSV"):
+                relevant.append(item)
+        if relevant:
+            metric_data = [["Archivo", "Mínimo (uA)", "Máximo (uA)", "Media (uA)", "DE (uA)"]] + [[item["archivo"], f"{item['i_min']:.3g}", f"{item['i_max']:.3g}", f"{item['i_media']:.3g}", f"{item['i_std']:.3g}"] for item in relevant]
+            metric_table = Table(metric_data, colWidths=[7.3*cm, 2.1*cm, 2.1*cm, 2.1*cm, 2.1*cm])
+            metric_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .35, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 7.7), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")])]))
+            story.append(Spacer(1, 8)); story.append(metric_table)
+
+    # El PDF utiliza el mismo análisis mostrado en pantalla, generado por Gemini
+    # y almacenado en analysis-store. El análisis local se conserva únicamente
+    # como respaldo si todavía no existe una respuesta de IA.
+    if not analysis_text or not str(analysis_text).strip():
+        analysis_text, _ = local_analysis(records or [], composition, researcher)
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Análisis electroquímico", styles["Section"]))
+    for raw_line in str(analysis_text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            story.append(Spacer(1, 4)); continue
+        clean_raw = line.replace("**", "")
+        if clean_raw.startswith("###"):
+            story.append(Paragraph(pdf_markup(clean_raw.lstrip("# ")), styles["Section"]))
+        elif clean_raw.startswith("##"):
+            continue
+        elif clean_raw.startswith("- "):
+            story.append(Paragraph("• " + pdf_markup(clean_raw[2:]), styles["BodySmall"]))
+        else:
+            story.append(Paragraph(pdf_markup(clean_raw), styles["BodySmall"]))
+
+    try:
+        doc.build(story)
+        buffer.seek(0)
+        filename = f"SENSA_Informe_{current_cell or 'Celda'}.pdf"
+        pdf_bytes = buffer.getvalue()
+
+        # Payload explícito para dcc.Download. Así el callback siempre devuelve
+        # exactamente los tres valores que Dash espera.
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+        download_payload = {
+            "content": pdf_b64,
+            "filename": filename,
+            "type": "application/pdf",
+            "base64": True,
+        }
+        print(f"[SENSA PDF] Informe generado correctamente: {filename} ({len(pdf_bytes)} bytes)", flush=True)
+        return download_payload, True, pdf_b64
+    except Exception as exc:
+        print(f"[SENSA PDF ERROR] {type(exc).__name__}: {exc}", flush=True)
+        return no_update, False, no_update
+
+
+if __name__ == "__main__":
+    app.run(
+        debug=os.getenv("DASH_DEBUG", "false").lower() == "true",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8050")),
+    )
