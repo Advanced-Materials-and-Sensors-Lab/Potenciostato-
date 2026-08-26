@@ -1,10 +1,9 @@
 <div align="center">
 
-# Potenciostato
-
-<img src="assets/logo.png" width="180">
-
 # SENSA
+
+<img src="assets/icono.png" width="180">
+
 
 ### Smart Environmental Nanofiber Sensing Architecture
 
