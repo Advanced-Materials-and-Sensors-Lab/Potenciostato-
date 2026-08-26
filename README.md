@@ -1,4 +1,6 @@
 # Potenciostato
+# SENSA
+# Smart Enviromental Nanofiber Sensing Architecture
 
 ## Open-Source ESP32-Based Potentiostat with Desktop Software, Mobile App and Machine Learning for Electrochemical Analysis
 
