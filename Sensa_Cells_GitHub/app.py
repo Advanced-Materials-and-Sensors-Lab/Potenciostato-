@@ -2908,6 +2908,8 @@ No agregues secciones correspondientes a técnicas inexistentes. No menciones ar
             client = OpenAI(
                 api_key=gemini_key,
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                timeout=float(os.getenv("SENSA_AI_TIMEOUT", "30")),
+                max_retries=0,
             )
             response = client.chat.completions.create(
                 model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
@@ -2916,7 +2918,11 @@ No agregues secciones correspondientes a técnicas inexistentes. No menciones ar
             text = response.choices[0].message.content
             provider_label = "Análisis con Gemini"
         else:
-            client = OpenAI(api_key=openai_key)
+            client = OpenAI(
+                api_key=openai_key,
+                timeout=float(os.getenv("SENSA_AI_TIMEOUT", "30")),
+                max_retries=0,
+            )
             response = client.responses.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
                 input=prompt,
@@ -2928,8 +2934,22 @@ No agregues secciones correspondientes a técnicas inexistentes. No menciones ar
             dcc.Markdown(text),
         ], className="analysis-box")
     except Exception as exc:
-        error_text = fallback_text + f"\n\n> La llamada de IA no pudo completarse: {exc}"
-        return error_text, html.Div([html.Div("Análisis local (IA no disponible)", className="analysis-kicker"), dcc.Markdown(error_text)], className="analysis-box")
+        print(
+            f"[SENSA AI ERROR] {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return fallback_text, html.Div([
+            html.Div("Análisis local SENSA", className="analysis-kicker"),
+            html.Div(
+                "Gemini no estuvo disponible. Se utilizó el análisis local de SENSA.",
+                style={
+                    "fontSize": "12px",
+                    "color": "#64748B",
+                    "marginBottom": "10px",
+                },
+            ),
+            dcc.Markdown(fallback_text),
+        ], className="analysis-box")
 
 
 @app.callback(
