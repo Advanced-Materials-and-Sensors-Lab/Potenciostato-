@@ -6,6 +6,9 @@ import json
 import os
 import re
 import zipfile
+import hashlib
+import hmac
+import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
+from flask import session
 
 # Optional integrations. The app still runs without OPENAI_API_KEY.
 try:
@@ -40,12 +44,138 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "archivos-celdas").strip()
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "Celdas").strip()
+SUPABASE_RESEARCHERS_TABLE = os.getenv("SUPABASE_RESEARCHERS_TABLE", "Investigadores").strip()
+ADMIN_USER = os.getenv("SENSA_ADMIN_USER", "").strip()
+ADMIN_PASSWORD = os.getenv("SENSA_ADMIN_PASSWORD", "")
+SESSION_SECRET = os.getenv("SENSA_SESSION_SECRET", "").strip() or secrets.token_hex(32)
 
 
 def get_supabase():
     if not (create_client and SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return None
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+def hash_researcher_key(raw_key: str, iterations: int = 240_000) -> str:
+    """Genera un hash PBKDF2-SHA256; nunca se guarda la clave original."""
+    clean = str(raw_key or "").strip()
+    if not clean:
+        raise ValueError("La clave no puede estar vacía.")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", clean.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_researcher_key(raw_key: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iter_text, salt_b64, digest_b64 = str(stored_hash or "").split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_b64.encode("ascii"))
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256", str(raw_key or "").strip().encode("utf-8"), salt, int(iter_text)
+        )
+        return hmac.compare_digest(candidate, expected)
+    except Exception:
+        return False
+
+
+def current_auth() -> dict[str, Any]:
+    role = str(session.get("sensa_role") or "visualizador").lower()
+    if role not in {"visualizador", "investigador", "admin"}:
+        role = "visualizador"
+    return {
+        "role": role,
+        "researcher": session.get("sensa_researcher"),
+        "admin_user": session.get("sensa_admin_user"),
+    }
+
+
+def can_edit() -> bool:
+    return current_auth()["role"] in {"investigador", "admin"}
+
+
+def is_admin() -> bool:
+    return current_auth()["role"] == "admin"
+
+
+def authenticated_researcher_name() -> str | None:
+    auth = current_auth()
+    if auth["role"] == "investigador":
+        return auth.get("researcher")
+    if auth["role"] == "admin":
+        # El administrador puede operar técnicamente, pero los ensayos deben quedar
+        # atribuidos a un investigador. Si no hay investigador activo, se registra Admin.
+        return auth.get("researcher") or auth.get("admin_user") or "Administrador SENSA"
+    return None
+
+
+def authenticate_researcher(raw_key: str) -> tuple[bool, str | None, str]:
+    client = get_supabase()
+    if client is None:
+        return False, None, "Supabase no está disponible para validar investigadores."
+    try:
+        rows = (
+            client.table(SUPABASE_RESEARCHERS_TABLE)
+            .select("id,nombre,clave_hash,activo")
+            .eq("activo", True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        return False, None, f"No se pudo consultar la tabla de investigadores: {exc}"
+    for row in rows:
+        if verify_researcher_key(raw_key, row.get("clave_hash")):
+            return True, str(row.get("nombre") or "Investigador SENSA"), "Acceso autorizado."
+    return False, None, "Clave de investigador incorrecta o inactiva."
+
+
+def register_researcher(name: str, raw_key: str) -> str:
+    if not is_admin():
+        raise PermissionError("Solo el administrador puede registrar investigadores.")
+    clean_name = " ".join(str(name or "").split())
+    clean_key = str(raw_key or "").strip()
+    if not clean_name or not clean_key:
+        raise ValueError("Completa el nombre y la clave única del investigador.")
+    if len(clean_key) < 8:
+        raise ValueError("La clave de investigador debe tener al menos 8 caracteres.")
+    client = get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase no está disponible.")
+    # Garantiza que una misma clave no pueda identificar a dos investigadores.
+    current_rows = (
+        client.table(SUPABASE_RESEARCHERS_TABLE)
+        .select("id,nombre,clave_hash")
+        .execute()
+        .data
+        or []
+    )
+    for row in current_rows:
+        if str(row.get("nombre") or "").casefold() == clean_name.casefold():
+            continue
+        if verify_researcher_key(clean_key, row.get("clave_hash")):
+            raise ValueError("Esa clave ya pertenece a otro investigador. Usa una clave diferente.")
+    payload = {"nombre": clean_name, "clave_hash": hash_researcher_key(clean_key), "activo": True}
+    existing = (
+        client.table(SUPABASE_RESEARCHERS_TABLE)
+        .select("id")
+        .eq("nombre", clean_name)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if existing:
+        client.table(SUPABASE_RESEARCHERS_TABLE).update(payload).eq("id", existing[0]["id"]).execute()
+        return f"✓ Clave actualizada para {clean_name}."
+    client.table(SUPABASE_RESEARCHERS_TABLE).insert(payload).execute()
+    return f"✓ {clean_name} registrado como investigador."
 
 
 def storage_upload(client, path: str, content: bytes, content_type: str) -> None:
@@ -73,6 +203,13 @@ SOFT = "#F7F9FC"
 
 app = Dash(__name__, title="SENSA Cells", suppress_callback_exceptions=True)
 server = app.server
+server.secret_key = SESSION_SECRET
+server.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("RENDER")),
+)
+
 app.index_string = """<!DOCTYPE html>
 <html>
     <head>
@@ -164,9 +301,13 @@ def load_database() -> dict[str, Any]:
                 manifest = json.loads(storage_download(client, f"{route}/manifest.json").decode("utf-8"))
                 manifest["supabase_row_id"] = row.get("id")
                 manifest["storage_route"] = route
-                # Una celda se identifica por su nombre (CELDA-001, etc.).
-                # Si existen filas históricas duplicadas, se muestra una sola.
-                cells_by_name[str(manifest.get("id") or row.get("nombre"))] = manifest
+                # La tabla de Supabase es la fuente canónica para el nombre de la celda.
+                # Así un manifest histórico no puede ocultar otra celda por tener un ID repetido.
+                cell_name = str(row.get("nombre") or manifest.get("id") or "").strip()
+                if not cell_name:
+                    continue
+                manifest["id"] = cell_name
+                cells_by_name[cell_name] = manifest
             except Exception:
                 # Un archivo dañado no impide mostrar el resto de celdas.
                 continue
@@ -661,13 +802,26 @@ def add_roi_feature_marker(fig, record, color, label):
     feature = analyze_roi_feature(record)
     if feature.get("tipo") not in ("pico", "meseta"):
         return
-    symbol = "diamond" if feature["tipo"] == "pico" else "square"
+
+    # Los rasgos se marcan de forma discreta y abierta para no crear
+    # cuadros sólidos en la gráfica ni elementos redundantes en la leyenda.
+    symbol = "diamond-open" if feature["tipo"] == "pico" else "square-open"
     fig.add_trace(go.Scatter(
-        x=[feature["vset_centro_V"]], y=[feature["corriente_uA"]], mode="markers",
-        marker=dict(size=10, symbol=symbol, color=color, line=dict(color="white", width=1.5)),
+        x=[feature["vset_centro_V"]],
+        y=[feature["corriente_uA"]],
+        mode="markers",
+        marker=dict(
+            size=11,
+            symbol=symbol,
+            color=color,
+            line=dict(color=color, width=2),
+        ),
         name=f"{feature['tipo'].capitalize()} {label}",
-        hovertemplate=(f"{feature['tipo'].capitalize()} {label}<br>Vset: %{{x:.3f}} V"
-                       f"<br>Corriente: %{{y:.3g}} uA<br>Ancho/extensión: {feature['ancho_V']:.3f} V<extra></extra>"),
+        showlegend=False,
+        hovertemplate=(
+            f"{feature['tipo'].capitalize()} {label}<br>Vset: %{{x:.3f}} V"
+            f"<br>Corriente: %{{y:.3g}} uA<br>Ancho/extensión: {feature['ancho_V']:.3f} V<extra></extra>"
+        ),
     ))
 
 
@@ -735,7 +889,377 @@ def make_lsv_mean_figure(records):
         fig.add_vline(x=float(grid[peak]), line_dash="dash", line_color="#EF6B6B", annotation_text=f"Máximo ROI {grid[peak]:.3f} V")
     fig.add_vrect(x0=ROI_VSET_MIN, x1=ROI_VSET_MAX, fillcolor="#F5B400", opacity=0.08, line_width=0)
     return base_layout(fig, "Vset (V)", "Corriente filtrada (uA)")
+def make_general_evolution_figure(records):
+    """
+    Superpone la evolución voltamétrica general de la celda
+    únicamente entre Vset = 0.0 y 0.6 V.
 
+    Incluye:
+    - CV Blanco
+    - CV con Cu²+
+    - LSV 1
+    - LSV 2
+    - LSV 3
+    - Promedio de las LSV
+
+    CA no se incluye porque se analiza contra tiempo.
+    """
+    fig = go.Figure()
+
+    VMIN = 0.0
+    VMAX = 0.6
+
+    def add_record_segments(record, name, color, dash="solid", width=2.0):
+        if not record:
+            return
+
+        x = np.asarray(record.get("x", []), dtype=float)
+        y = record_signal(record)
+
+        size = min(len(x), len(y))
+        x = x[:size]
+        y = y[:size]
+
+        valid = (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & (x >= VMIN)
+            & (x <= VMAX)
+        )
+
+        indices = np.where(valid)[0]
+        if not len(indices):
+            return
+
+        # Evita unir artificialmente ramas distintas del CV.
+        groups = np.split(
+            indices,
+            np.where(np.diff(indices) > 1)[0] + 1
+        )
+
+        first = True
+
+        for group in groups:
+            if len(group) < 3:
+                continue
+
+            fig.add_trace(go.Scatter(
+                x=x[group],
+                y=y[group],
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=first,
+                line=dict(
+                    color=color,
+                    width=width,
+                    dash=dash,
+                ),
+                hovertemplate=(
+                    f"{name}"
+                    "<br>Vset: %{x:.3f} V"
+                    "<br>Corriente: %{y:.3g} uA"
+                    "<extra></extra>"
+                ),
+            ))
+
+            first = False
+
+    # ---------------------------------------------------------
+    # CV
+    # ---------------------------------------------------------
+    cv_blank = get_record(records, "CV", "blanco")
+    cv_cu = get_record(records, "CV", "cobre")
+
+    add_record_segments(
+        cv_blank,
+        "CV Blanco",
+        BLUE,
+        "solid",
+        2.4,
+    )
+
+    add_record_segments(
+        cv_cu,
+        "CV Cu²⁺",
+        YELLOW,
+        "solid",
+        2.4,
+    )
+
+    # ---------------------------------------------------------
+    # LSV individuales
+    # ---------------------------------------------------------
+    lsv_definitions = [
+        (1, "#334155", "solid"),
+        (2, BLUE_2, "dash"),
+        (3, "#64748B", "dot"),
+    ]
+
+    lsv_records = []
+
+    for rep, color, dash in lsv_definitions:
+        record = get_record(records, "LSV", "cobre", rep)
+
+        if record:
+            lsv_records.append(record)
+
+        add_record_segments(
+            record,
+            f"LSV {rep}",
+            color,
+            dash,
+            1.8,
+        )
+
+    # ---------------------------------------------------------
+    # Promedio LSV
+    # ---------------------------------------------------------
+    if len(lsv_records) >= 2:
+
+        grid = np.linspace(VMIN, VMAX, 250)
+        aligned = []
+
+        for record in lsv_records:
+            x = np.asarray(record.get("x", []), dtype=float)
+            y = record_signal(record)
+
+            size = min(len(x), len(y))
+            x = x[:size]
+            y = y[:size]
+
+            valid = np.isfinite(x) & np.isfinite(y)
+
+            x = x[valid]
+            y = y[valid]
+
+            order = np.argsort(x)
+            x = x[order]
+            y = y[order]
+
+            # Evita problemas de interpolación por Vset repetido.
+            x_unique, unique_idx = np.unique(x, return_index=True)
+            y_unique = y[unique_idx]
+
+            if len(x_unique) >= 2:
+                aligned.append(
+                    np.interp(grid, x_unique, y_unique)
+                )
+
+        if len(aligned) >= 2:
+            mean_lsv = np.nanmean(
+                np.vstack(aligned),
+                axis=0
+            )
+
+            fig.add_trace(go.Scatter(
+                x=grid,
+                y=mean_lsv,
+                mode="lines",
+                name="Promedio LSV",
+                line=dict(
+                    color="#111111",
+                    width=3.2,
+                ),
+                hovertemplate=(
+                    "Promedio LSV"
+                    "<br>Vset: %{x:.3f} V"
+                    "<br>Corriente: %{y:.3g} uA"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig = base_layout(
+        fig,
+        "Vset (V)",
+        "Corriente filtrada (uA)",
+    )
+
+    fig.update_xaxes(
+        range=[VMIN, VMAX],
+        dtick=0.1,
+    )
+
+    fig.update_layout(
+        height=330,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=9),
+        ),
+        margin=dict(
+            l=55,
+            r=20,
+            t=65,
+            b=50,
+        ),
+    )
+
+    return fig
+
+
+
+def make_pdf_chart_png(records, chart_kind: str) -> io.BytesIO:
+    """Genera las figuras estáticas del informe con Matplotlib, sin Kaleido/Chrome."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    records = records or []
+    fig, ax = plt.subplots(figsize=(9.5, 4.1), dpi=140)
+
+    def finish(xlabel: str, ylabel: str, xlim=None):
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        ax.grid(True, alpha=0.22, linewidth=0.7)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.16),
+                ncol=min(4, max(1, len(labels))),
+                frameon=False,
+                fontsize=8,
+            )
+        fig.tight_layout(rect=[0, 0, 1, 0.91])
+        image = io.BytesIO()
+        fig.savefig(image, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        image.seek(0)
+        return image
+
+    def plot_record(record, label, color, linestyle="-", linewidth=1.8, mask=None):
+        if not record:
+            return
+        x = np.asarray(record.get("x", []), dtype=float)
+        y = record_signal(record)
+        size = min(len(x), len(y))
+        x, y = x[:size], y[:size]
+        valid = np.isfinite(x) & np.isfinite(y)
+        if mask is not None:
+            valid &= mask(x)
+        indices = np.where(valid)[0]
+        if not len(indices):
+            return
+        groups = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        first = True
+        for group in groups:
+            if len(group) < 2:
+                continue
+            ax.plot(
+                x[group],
+                y[group],
+                label=label if first else None,
+                color=color,
+                linestyle=linestyle,
+                linewidth=linewidth,
+            )
+            first = False
+
+    if chart_kind == "ca":
+        plot_record(get_record(records, "CA", "blanco"), "CA Blanco filtrado", BLUE, "-", 2.0)
+        plot_record(get_record(records, "CA", "cobre"), "CA Cu²⁺ filtrado", YELLOW, "-", 2.0)
+        return finish("Tiempo (s)", "Corriente filtrada (uA)")
+
+    if chart_kind == "cv":
+        plot_record(get_record(records, "CV", "blanco"), "CV Blanco filtrado", BLUE, "-", 2.0)
+        plot_record(get_record(records, "CV", "cobre"), "CV Cu²⁺ filtrado", YELLOW, "-", 2.0)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "lsv":
+        definitions = [
+            (1, YELLOW, "-"),
+            (2, "#334155", "-"),
+            (3, BLUE_2, "--"),
+        ]
+        for rep, color, linestyle in definitions:
+            plot_record(get_record(records, "LSV", "cobre", rep), f"LSV {rep} filtrada", color, linestyle, 1.9)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "lsv_mean":
+        curves = [get_record(records, "LSV", "cobre", rep) for rep in (1, 2, 3)]
+        curves = [curve for curve in curves if curve]
+        if curves:
+            xmin = max(min(curve["x"]) for curve in curves)
+            xmax = min(max(curve["x"]) for curve in curves)
+            grid = np.linspace(xmin, xmax, 300)
+            aligned = []
+            for curve in curves:
+                x = np.asarray(curve["x"], dtype=float)
+                y = record_signal(curve)
+                size = min(len(x), len(y))
+                x, y = x[:size], y[:size]
+                valid = np.isfinite(x) & np.isfinite(y)
+                x, y = x[valid], y[valid]
+                order = np.argsort(x)
+                x, y = x[order], y[order]
+                x_unique, unique_idx = np.unique(x, return_index=True)
+                y_unique = y[unique_idx]
+                if len(x_unique) >= 2:
+                    aligned.append(np.interp(grid, x_unique, y_unique))
+            if aligned:
+                matrix = np.vstack(aligned)
+                mean = np.nanmean(matrix, axis=0)
+                std = np.nanstd(matrix, axis=0)
+                ax.fill_between(grid, mean - std, mean + std, alpha=0.20, label="± 1 DE")
+                ax.plot(grid, mean, color="#111111", linewidth=2.4, label="Promedio LSV")
+                roi_indices = np.where((grid >= ROI_VSET_MIN) & (grid <= ROI_VSET_MAX))[0]
+                if len(roi_indices):
+                    peak = int(roi_indices[np.nanargmax(mean[roi_indices])])
+                    ax.axvline(float(grid[peak]), linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.axvspan(ROI_VSET_MIN, ROI_VSET_MAX, alpha=0.08)
+        return finish("Vset (V)", "Corriente filtrada (uA)")
+
+    if chart_kind == "general":
+        vmin, vmax = 0.0, 0.6
+        roi_mask = lambda x: (x >= vmin) & (x <= vmax)
+        plot_record(get_record(records, "CV", "blanco"), "CV Blanco", BLUE, "-", 2.0, roi_mask)
+        plot_record(get_record(records, "CV", "cobre"), "CV Cu²⁺", YELLOW, "-", 2.0, roi_mask)
+
+        definitions = [
+            (1, "#334155", "-"),
+            (2, BLUE_2, "--"),
+            (3, "#64748B", ":"),
+        ]
+        lsv_records = []
+        for rep, color, linestyle in definitions:
+            record = get_record(records, "LSV", "cobre", rep)
+            if record:
+                lsv_records.append(record)
+            plot_record(record, f"LSV {rep}", color, linestyle, 1.6, roi_mask)
+
+        if len(lsv_records) >= 2:
+            grid = np.linspace(vmin, vmax, 250)
+            aligned = []
+            for record in lsv_records:
+                x = np.asarray(record.get("x", []), dtype=float)
+                y = record_signal(record)
+                size = min(len(x), len(y))
+                x, y = x[:size], y[:size]
+                valid = np.isfinite(x) & np.isfinite(y)
+                x, y = x[valid], y[valid]
+                order = np.argsort(x)
+                x, y = x[order], y[order]
+                x_unique, unique_idx = np.unique(x, return_index=True)
+                y_unique = y[unique_idx]
+                if len(x_unique) >= 2:
+                    aligned.append(np.interp(grid, x_unique, y_unique))
+            if len(aligned) >= 2:
+                mean = np.nanmean(np.vstack(aligned), axis=0)
+                ax.plot(grid, mean, color="#111111", linewidth=2.5, label="Promedio LSV")
+
+        ax.set_xticks(np.arange(0.0, 0.61, 0.1))
+        return finish("Vset (V)", "Corriente filtrada (uA)", (vmin, vmax))
+
+    plt.close(fig)
+    raise ValueError(f"Tipo de gráfica PDF no reconocido: {chart_kind}")
 
 # -----------------------------------------------------------------------------
 # UI helpers
@@ -781,33 +1305,39 @@ def chart_card(title, graph_id, figure):
     )
 
 
-def recent_cell(name, ppm, when, status="Incompleta", researcher="Sin asignar", deletable=False):
-    delete_control = []
-    if deletable:
-        delete_control = [
-            html.Button("Ver", id={"type": "select-cell", "index": name}, n_clicks=0, title=f"Abrir {name}", style={
-                "border": "1px solid #0B438D", "borderRadius": "6px", "background": "white",
-                "color": "#0B438D", "fontSize": "11px", "cursor": "pointer", "padding": "4px 7px"
-            }),
-            html.Button("Descargar", id={"type": "download-cell", "index": name}, n_clicks=0, title=f"Descargar {name} en ZIP", style={
-                "border": "1px solid #0B438D", "borderRadius": "6px", "background": "#0B438D",
-                "color": "white", "fontSize": "11px", "cursor": "pointer", "padding": "4px 7px"
-            }),
+def recent_cell(name, ppm, when, status="Incompleta", researcher="Sin asignar", can_delete=False):
+    actions = [
+        html.Button("Ver", id={"type": "select-cell", "index": name}, n_clicks=0, title=f"Abrir {name}", style={
+            "border": "1px solid #0B438D", "borderRadius": "6px", "background": "white",
+            "color": "#0B438D", "fontSize": "11px", "cursor": "pointer", "padding": "4px 7px"
+        }),
+        html.Button("PDF", id={"type": "download-pdf", "index": name}, n_clicks=0, title=f"Descargar el PDF oficial de {name}", style={
+            "border": "1px solid #0B438D", "borderRadius": "6px", "background": "white",
+            "color": "#0B438D", "fontSize": "11px", "cursor": "pointer", "padding": "4px 7px"
+        }),
+        html.Button("ZIP", id={"type": "download-cell", "index": name}, n_clicks=0, title=f"Descargar {name} en ZIP", style={
+            "border": "1px solid #0B438D", "borderRadius": "6px", "background": "#0B438D",
+            "color": "white", "fontSize": "11px", "cursor": "pointer", "padding": "4px 7px"
+        }),
+    ]
+    if can_delete:
+        actions.append(
             dcc.ConfirmDialogProvider(
-            id={"type": "delete-cell", "index": name},
-            message=f"¿Deseas eliminar {name}? Esta acción no se puede deshacer.",
-            children=html.Button("×", title=f"Eliminar {name}", style={
-                "border": "none", "background": "transparent", "color": "#DC2626",
-                "fontSize": "22px", "cursor": "pointer", "padding": "0 0 0 8px"
-            }),
+                id={"type": "delete-cell", "index": name},
+                message=f"¿Deseas eliminar {name}? Esta acción no se puede deshacer.",
+                children=html.Button("×", title=f"Eliminar {name}", style={
+                    "border": "none", "background": "transparent", "color": "#DC2626",
+                    "fontSize": "22px", "cursor": "pointer", "padding": "0 0 0 8px"
+                }),
             )
-        ]
+        )
     return html.Div(className="recent-row", children=[
         html.Img(src="/assets/icono.png", className="recent-icon"),
         html.Div([html.Div(name, className="recent-name"), html.Div(status, className="recent-status"), html.Div(researcher, className="recent-time")], className="recent-main"),
         html.Div([html.Span(ppm, className="ppm-chip small"), html.Div(when, className="recent-time")]),
-        *delete_control,
+        *actions,
     ])
+
 
 
 EMPTY_RECORDS: list[dict[str, Any]] = []
@@ -822,6 +1352,14 @@ INITIAL_CELL_ID = INITIAL_CELL.get("id") if INITIAL_CELL else None
 app.layout = html.Div(className="app-shell", children=[
     dcc.Store(id="records-store", data=INITIAL_RECORDS),
     dcc.Store(id="database-store", data=INITIAL_DATABASE),
+    dcc.Store(id="auth-store", data={"role": "visualizador", "researcher": None, "admin_user": None}, storage_type="session"),
+    dcc.Interval(id="auth-session-on-start", interval=300, n_intervals=0, max_intervals=1),
+    dcc.Interval(
+    id="reload-database-on-start",
+    interval=800,
+    n_intervals=0,
+    max_intervals=1,
+    ),
     dcc.Store(id="current-cell-store", data=INITIAL_CELL_ID),
     dcc.Store(id="report-ready-store", data=bool(INITIAL_CELL and INITIAL_CELL.get("report_generated"))),
     dcc.Store(id="draft-mode-store", data=False),
@@ -829,6 +1367,7 @@ app.layout = html.Div(className="app-shell", children=[
     dcc.Store(id="pdf-content-store", data=None),
     dcc.Store(id="active-page-store", data="cells"),
     dcc.Download(id="pdf-download"),
+    dcc.Download(id="saved-pdf-download"),
     dcc.Download(id="cell-zip-download"),
     html.Header(className="topbar", children=[
         html.Div(className="brand-wrap", children=[
@@ -844,38 +1383,75 @@ app.layout = html.Div(className="app-shell", children=[
             html.Div([html.Span("✧"), " Machine Learning"], id="nav-ml", n_clicks=0, className="nav-item", style={"cursor": "pointer"}),
         ]),
         html.Div(id="profile-button", n_clicks=0, className="profile", style={"cursor": "pointer"}, children=[
-            html.Div("--", id="profile-initials", className="avatar"),
-            html.Div([html.Div("Seleccionar investigador", id="profile-name", className="profile-name"), html.Div("SENSA", id="profile-role", className="profile-role")]),
+            html.Div("V", id="profile-initials", className="avatar"),
+            html.Div([html.Div("Visualizador", id="profile-name", className="profile-name"), html.Div("Acceso de solo lectura", id="profile-role", className="profile-role")]),
             html.Div("⌄", className="profile-chevron"),
         ]),
     ]),
 
     html.Div(id="researcher-panel", style={
         "display": "none", "position": "fixed", "right": "20px", "top": "84px",
-        "zIndex": 2000, "width": "360px", "maxWidth": "calc(100vw - 32px)", "padding": "24px", "background": "white",
-        "boxSizing": "border-box", "overflow": "visible", "border": "1px solid #DCE4EF", "borderRadius": "14px", "boxShadow": "0 16px 40px rgba(15,23,42,.18)"
+        "zIndex": 2000, "width": "390px", "maxWidth": "calc(100vw - 32px)", "padding": "24px", "background": "white",
+        "boxSizing": "border-box", "overflowY": "auto", "maxHeight": "calc(100vh - 110px)",
+        "border": "1px solid #DCE4EF", "borderRadius": "14px", "boxShadow": "0 16px 40px rgba(15,23,42,.18)"
     }, children=[
-        html.H3("Investigador activo", style={"marginTop": 0}),
-        html.P("Selecciona quién está analizando la celda.", style={"color": MUTED, "fontSize": "13px"}),
-        dcc.Dropdown(
-            id="researcher-dropdown",
-            options=[{"label": name, "value": name} for name in INITIAL_DATABASE.get("researchers", [])],
-            value=INITIAL_DATABASE.get("current_researcher"),
-            placeholder="Seleccionar investigador",
-            clearable=False,
-            className="sensa-dropdown",
-        ),
-        html.Div(style={"height": "14px"}),
-        html.Label("Registrar nuevo investigador", style={"display": "block", "marginBottom": "7px", "fontWeight": "600", "color": INK}),
-        dcc.Input(id="new-researcher-name", placeholder="Nombre y apellido", style={
-            "width": "100%", "height": "44px", "boxSizing": "border-box", "padding": "0 14px", "margin": "0",
-            "fontSize": "14px", "lineHeight": "22px", "color": INK, "background": "#FFFFFF",
-            "border": "1px solid #CBD5E1", "borderRadius": "9px"
+        html.H3("Acceso SENSA", style={"marginTop": 0}),
+        html.Div(id="auth-current-status", className="metric-note", style={"marginBottom": "16px"}),
+
+        html.Div(id="researcher-login-section", children=[
+            html.Div("Acceso de investigador", style={"fontWeight": "700", "color": INK, "marginBottom": "6px"}),
+            html.P("Ingresa únicamente tu clave personal de investigador.", style={"color": MUTED, "fontSize": "13px", "marginTop": 0}),
+            dcc.Input(
+                id="researcher-key-input", type="password", placeholder="Clave única de investigador",
+                autoComplete="current-password", style={
+                    "width": "100%", "height": "44px", "boxSizing": "border-box", "padding": "0 14px",
+                    "fontSize": "14px", "border": "1px solid #CBD5E1", "borderRadius": "9px"
+                }
+            ),
+            html.Button("Acceder como investigador", id="researcher-login-btn", n_clicks=0, className="primary-action", style={
+                "width": "100%", "marginTop": "10px", "height": "44px", "borderRadius": "9px"
+            }),
+        ]),
+
+        html.Hr(style={"border": 0, "borderTop": "1px solid #E2E8F0", "margin": "20px 0"}),
+
+        html.Div(id="admin-login-section", children=[
+            html.Div("Administración", style={"fontWeight": "700", "color": INK, "marginBottom": "6px"}),
+            html.P("Acceso reservado para administración de SENSA.", style={"color": MUTED, "fontSize": "13px", "marginTop": 0}),
+            dcc.Input(id="admin-user-input", placeholder="Usuario", autoComplete="username", style={
+                "width": "100%", "height": "44px", "boxSizing": "border-box", "padding": "0 14px",
+                "fontSize": "14px", "border": "1px solid #CBD5E1", "borderRadius": "9px", "marginBottom": "8px"
+            }),
+            dcc.Input(id="admin-password-input", type="password", placeholder="Contraseña", autoComplete="current-password", style={
+                "width": "100%", "height": "44px", "boxSizing": "border-box", "padding": "0 14px",
+                "fontSize": "14px", "border": "1px solid #CBD5E1", "borderRadius": "9px"
+            }),
+            html.Button("Iniciar sesión como administrador", id="admin-login-btn", n_clicks=0, className="secondary-action", style={
+                "width": "100%", "marginTop": "10px", "height": "44px", "borderRadius": "9px"
+            }),
+        ]),
+
+        html.Div(id="admin-researcher-section", style={"display": "none", "marginTop": "18px", "paddingTop": "18px", "borderTop": "1px solid #E2E8F0"}, children=[
+            html.Div("Registrar investigador", style={"fontWeight": "700", "color": INK, "marginBottom": "6px"}),
+            html.P("La clave se almacena únicamente como hash seguro.", style={"color": MUTED, "fontSize": "12px", "marginTop": 0}),
+            dcc.Input(id="admin-new-researcher-name", placeholder="Nombre y apellido", style={
+                "width": "100%", "height": "42px", "boxSizing": "border-box", "padding": "0 12px",
+                "border": "1px solid #CBD5E1", "borderRadius": "8px", "marginBottom": "8px"
+            }),
+            dcc.Input(id="admin-new-researcher-key", type="password", placeholder="Clave única (mínimo 8 caracteres)", style={
+                "width": "100%", "height": "42px", "boxSizing": "border-box", "padding": "0 12px",
+                "border": "1px solid #CBD5E1", "borderRadius": "8px"
+            }),
+            html.Button("Registrar / actualizar investigador", id="admin-save-researcher-btn", n_clicks=0, className="primary-action", style={
+                "width": "100%", "marginTop": "10px"
+            }),
+            html.Div(id="admin-researcher-status", style={"fontSize": "12px", "marginTop": "8px"}),
+        ]),
+
+        html.Button("Cerrar sesión", id="logout-btn", n_clicks=0, className="secondary-action", style={
+            "display": "none", "width": "100%", "marginTop": "18px"
         }),
-        html.Button("Agregar investigador", id="add-researcher-btn", n_clicks=0, className="primary-action", style={
-            "width": "100%", "marginTop": "14px", "height": "46px", "borderRadius": "9px", "fontSize": "15px"
-        }),
-        html.Div(id="researcher-status", style={"fontSize": "12px", "marginTop": "8px", "color": GREEN}),
+        html.Div(id="auth-status", style={"fontSize": "12px", "marginTop": "10px"}),
     ]),
 
     html.Main(id="cells-page", className="page", children=[
@@ -894,7 +1470,7 @@ app.layout = html.Div(className="app-shell", children=[
         html.Section(className="dashboard-grid", children=[
             # Left column
             html.Aside(className="left-column", children=[
-                html.Div(className="panel upload-panel", children=[
+                html.Div(id="new-cell-panel", className="panel upload-panel", children=[
                     html.Div(className="upload-dropzone", children=[
                         html.H3("Crear nueva celda"),
                         html.Div("＋", className="upload-cloud"),
@@ -904,7 +1480,7 @@ app.layout = html.Div(className="app-shell", children=[
                     html.Div(id="upload-status", className="upload-status"),
                 ]),
 
-                html.Div(className="panel filters-panel", children=[
+                html.Div(id="cell-data-panel", className="panel filters-panel", children=[
                     html.Div([html.H3("Datos de la celda")], className="panel-title-row"),
                     html.Label("Material del electrodo"),
                     dcc.Dropdown(id="cell-material", options=["PAN", "PAN-Ag", "Grafito", "Otro"], placeholder="Seleccionar material", clearable=False, className="sensa-dropdown"),
@@ -972,7 +1548,7 @@ app.layout = html.Div(className="app-shell", children=[
                     chart_card("CV Blanco vs CV Cu²⁺", "cv-chart", EMPTY_CV),
                 ]),
 
-                html.Div(className="panel ai-panel", children=[
+                html.Div(id="ai-actions-panel", className="panel ai-panel", children=[
                     html.Div(className="ai-copy", children=[
                         html.Div("✧", className="ai-icon"),
                         html.Div([html.H3("Informe electroquímico automático"), html.P("Analiza tus datos con IA y genera informes profesionales con interpretaciones, comparaciones y conclusiones.")]),
@@ -981,7 +1557,7 @@ app.layout = html.Div(className="app-shell", children=[
                     html.Button("▧  Generar informe PDF", id="pdf-btn", className="secondary-action", n_clicks=0),
                 ]),
                 dcc.Loading(html.Div(id="analysis-result", className="analysis-result"), type="circle"),
-                html.Div(className="panel", style={"padding": "18px", "marginTop": "14px", "display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "16px"}, children=[
+                html.Div(id="finalize-panel", className="panel", style={"padding": "18px", "marginTop": "14px", "display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "16px"}, children=[
                     html.Div([html.H3("Finalizar celda", style={"margin": "0 0 5px"}), html.Div("Requiere protocolo 7/7 e informe PDF generado.", className="metric-note")]),
                     html.Div(style={"display": "flex", "gap": "10px"}, children=[
                         html.Button("Descartar borrador", id="discard-draft-btn", n_clicks=0, className="secondary-action"),
@@ -1157,50 +1733,145 @@ def calculate_cell_composition(electrolyte, electrolyte_concentration, electroly
         f"Volumen final: {final_volume:g} mL | Cu final estimado: {final_copper:.3g} ppm."
     )
     return round(final_copper, 6), text
+@app.callback(
+    Output("database-store", "data", allow_duplicate=True),
+    Input("reload-database-on-start", "n_intervals"),
+    prevent_initial_call=True,
+)
+def reload_database_on_start(n_intervals):
+    if not n_intervals:
+        return no_update
+
+    return load_database()
+
+@app.callback(
+    Output("auth-store", "data", allow_duplicate=True),
+    Input("auth-session-on-start", "n_intervals"),
+    prevent_initial_call=True,
+)
+def restore_auth_session(n_intervals):
+    if not n_intervals:
+        return no_update
+    return current_auth()
 
 
 @app.callback(
-    Output("database-store", "data", allow_duplicate=True),
-    Output("researcher-dropdown", "options"),
-    Output("researcher-dropdown", "value"),
-    Output("researcher-status", "children"),
-    Input("add-researcher-btn", "n_clicks"),
-    State("new-researcher-name", "value"),
-    State("database-store", "data"),
+    Output("auth-store", "data", allow_duplicate=True),
+    Output("auth-status", "children", allow_duplicate=True),
+    Output("researcher-key-input", "value"),
+    Input("researcher-login-btn", "n_clicks"),
+    State("researcher-key-input", "value"),
     prevent_initial_call=True,
 )
-def add_researcher(n_clicks, name, database):
-    clean_name = " ".join(str(name or "").split())
-    database = database or load_database()
-    if not clean_name:
-        return no_update, no_update, no_update, "Escribe el nombre y apellido."
-    researchers = database.setdefault("researchers", [])
-    existing = next((item for item in researchers if item.casefold() == clean_name.casefold()), None)
-    selected = existing or clean_name
-    if not existing:
-        researchers.append(clean_name)
-        researchers.sort(key=str.casefold)
-    database["current_researcher"] = selected
-    save_database(database)
-    options = [{"label": item, "value": item} for item in researchers]
-    return database, options, selected, f"✓ {selected} es el investigador activo."
+def login_researcher(n_clicks, raw_key):
+    if not raw_key:
+        return no_update, html.Span("Escribe tu clave de investigador.", style={"color": "#DC2626"}), no_update
+    ok, name, message = authenticate_researcher(raw_key)
+    if not ok:
+        return no_update, html.Span(message, style={"color": "#DC2626"}), ""
+    session.clear()
+    session["sensa_role"] = "investigador"
+    session["sensa_researcher"] = name
+    session.permanent = False
+    return current_auth(), html.Span(f"✓ Acceso autorizado: {name}", style={"color": GREEN}), ""
 
 
 @app.callback(
-    Output("database-store", "data", allow_duplicate=True),
-    Input("researcher-dropdown", "value"),
-    State("database-store", "data"),
+    Output("auth-store", "data", allow_duplicate=True),
+    Output("auth-status", "children", allow_duplicate=True),
+    Output("admin-user-input", "value"),
+    Output("admin-password-input", "value"),
+    Input("admin-login-btn", "n_clicks"),
+    State("admin-user-input", "value"),
+    State("admin-password-input", "value"),
     prevent_initial_call=True,
 )
-def select_researcher(researcher, database):
-    if not researcher:
-        return no_update
-    database = database or load_database()
-    if researcher not in database.get("researchers", []):
-        return no_update
-    database["current_researcher"] = researcher
-    save_database(database)
-    return database
+def login_admin(n_clicks, username, password):
+    user = str(username or "").strip()
+    passwd = str(password or "")
+    if not ADMIN_USER or not ADMIN_PASSWORD:
+        return no_update, html.Span("Configura SENSA_ADMIN_USER y SENSA_ADMIN_PASSWORD en Render.", style={"color": "#DC2626"}), user, ""
+    if not (hmac.compare_digest(user, ADMIN_USER) and hmac.compare_digest(passwd, ADMIN_PASSWORD)):
+        return no_update, html.Span("Usuario o contraseña de administrador incorrectos.", style={"color": "#DC2626"}), user, ""
+    session.clear()
+    session["sensa_role"] = "admin"
+    session["sensa_admin_user"] = user
+    session.permanent = False
+    return current_auth(), html.Span("✓ Sesión de administrador iniciada.", style={"color": GREEN}), "", ""
+
+
+@app.callback(
+    Output("auth-store", "data", allow_duplicate=True),
+    Output("auth-status", "children", allow_duplicate=True),
+    Input("logout-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def logout_user(n_clicks):
+    session.clear()
+    return {"role": "visualizador", "researcher": None, "admin_user": None}, html.Span("Sesión cerrada. Modo visualizador activo.", style={"color": MUTED})
+
+
+@app.callback(
+    Output("admin-researcher-status", "children"),
+    Output("admin-new-researcher-name", "value"),
+    Output("admin-new-researcher-key", "value"),
+    Input("admin-save-researcher-btn", "n_clicks"),
+    State("admin-new-researcher-name", "value"),
+    State("admin-new-researcher-key", "value"),
+    prevent_initial_call=True,
+)
+def admin_save_researcher(n_clicks, name, raw_key):
+    try:
+        message = register_researcher(name, raw_key)
+        return html.Span(message, style={"color": GREEN}), "", ""
+    except Exception as exc:
+        return html.Span(str(exc), style={"color": "#DC2626"}), no_update, ""
+
+
+@app.callback(
+    Output("auth-current-status", "children"),
+    Output("researcher-login-section", "style"),
+    Output("admin-login-section", "style"),
+    Output("admin-researcher-section", "style"),
+    Output("logout-btn", "style"),
+    Output("new-cell-panel", "style"),
+    Output("cell-data-panel", "style"),
+    Output("upload-blank", "style"),
+    Output("upload-copper", "style"),
+    Output("ai-actions-panel", "style"),
+    Output("finalize-panel", "style"),
+    Input("auth-store", "data"),
+)
+def apply_role_ui(auth):
+    auth = auth or {"role": "visualizador"}
+    role = str(auth.get("role") or "visualizador").lower()
+    editable = role in {"investigador", "admin"}
+    if role == "investigador":
+        label = f"Investigador activo: {auth.get('researcher') or 'SENSA'}"
+    elif role == "admin":
+        label = f"Administrador activo: {auth.get('admin_user') or 'SENSA'}"
+    else:
+        label = "Modo visualizador: consulta y descarga, sin modificar datos."
+    hidden = {"display": "none"}
+    visible = {}
+    admin_tools_visible = {"display": "block", "marginTop": "18px", "paddingTop": "18px", "borderTop": "1px solid #E2E8F0"}
+    logout_style = {"display": "block", "width": "100%", "marginTop": "18px"} if role != "visualizador" else {"display": "none"}
+    finalize_style = {"padding": "18px", "marginTop": "14px", "display": "flex", "alignItems": "center", "justifyContent": "space-between", "gap": "16px"} if editable else hidden
+    return (
+        label,
+        visible if role == "visualizador" else hidden,
+        visible if role == "visualizador" else hidden,
+        admin_tools_visible if role == "admin" else hidden,
+        logout_style,
+        visible if editable else hidden,
+        visible if editable else hidden,
+        visible if editable else hidden,
+        visible if editable else hidden,
+        visible if editable else hidden,
+        finalize_style,
+    )
+
+
 
 
 @app.callback(
@@ -1274,6 +1945,29 @@ def download_saved_cell(n_clicks, database):
 
 
 @app.callback(
+    Output("saved-pdf-download", "data"),
+    Input({"type": "download-pdf", "index": ALL}, "n_clicks"),
+    State("database-store", "data"),
+    prevent_initial_call=True,
+)
+def download_saved_pdf(n_clicks, database):
+    triggered = ctx.triggered_id
+    if not isinstance(triggered, dict) or not any(n_clicks or []):
+        return no_update
+    cell_id = triggered.get("index")
+    cell = next((item for item in (database or {}).get("cells", []) if item.get("id") == cell_id), None)
+    if not cell:
+        return no_update
+    pdf_item = next((item for item in cell.get("storage_files", []) if item.get("type") == "pdf"), None)
+    client = get_supabase()
+    if not (client and pdf_item and pdf_item.get("path")):
+        return no_update
+    pdf_bytes = storage_download(client, str(pdf_item.get("path")))
+    filename = str(pdf_item.get("name") or cell.get("report_filename") or f"SENSA_Informe_{cell_id}.pdf")
+    return dcc.send_bytes(pdf_bytes, filename)
+
+
+@app.callback(
     Output("database-store", "data", allow_duplicate=True),
     Output("records-store", "data", allow_duplicate=True),
     Output("current-cell-store", "data", allow_duplicate=True),
@@ -1283,6 +1977,8 @@ def download_saved_cell(n_clicks, database):
     prevent_initial_call=True,
 )
 def delete_cell(submit_clicks, database, current_cell):
+    if not is_admin():
+        return no_update, no_update, no_update
     triggered = ctx.triggered_id
     if not isinstance(triggered, dict) or not any(submit_clicks or []):
         return no_update, no_update, no_update
@@ -1338,12 +2034,14 @@ def delete_cell(submit_clicks, database, current_cell):
     prevent_initial_call=True,
 )
 def new_cell(n_clicks, database, draft_mode):
+    if not can_edit():
+        return (no_update, html.Div("Modo visualizador: inicia sesión como investigador para crear una celda.", className="upload-error"), *([no_update] * 13))
     database = database or load_database()
     if draft_mode:
         return (no_update, html.Div("Ya existe un borrador activo. Guárdalo o descártalo antes de crear otra celda.", className="upload-error"), *([no_update] * 13))
-    researcher = database.get("current_researcher")
+    researcher = authenticated_researcher_name()
     if not researcher:
-        return (no_update, html.Div("Selecciona o registra un investigador antes de crear una celda.", className="upload-error"), *([no_update] * 13))
+        return (no_update, html.Div("No hay una sesión de investigador activa.", className="upload-error"), *([no_update] * 13))
     cell_id = next_cell_id(database)
     return (
         [], html.Div([html.Strong(f"✓ Borrador {cell_id} creado."), html.Br(), "Completa los datos reales y carga los dos bloques de archivos."], className="upload-ok"),
@@ -1364,6 +2062,8 @@ def new_cell(n_clicks, database, draft_mode):
     prevent_initial_call=True,
 )
 def load_blank(contents_list, filenames, cell_id, current_records, draft_mode):
+    if not can_edit():
+        return no_update, no_update, html.Div("Modo visualizador: no puedes cargar archivos.", className="upload-error")
     if not cell_id or not draft_mode:
         return no_update, no_update, html.Div("Primero crea una nueva celda.", className="upload-error")
     records, errors = parse_upload(contents_list, filenames)
@@ -1392,6 +2092,8 @@ def load_blank(contents_list, filenames, cell_id, current_records, draft_mode):
     prevent_initial_call=True,
 )
 def load_copper(contents_list, filenames, concentration, cell_id, current_records, draft_mode):
+    if not can_edit():
+        return no_update, no_update, html.Div("Modo visualizador: no puedes cargar archivos.", className="upload-error")
     if not cell_id or not draft_mode:
         return no_update, no_update, html.Div("Primero crea una nueva celda.", className="upload-error")
     if concentration is None or float(concentration) < 0:
@@ -1426,13 +2128,14 @@ def load_copper(contents_list, filenames, concentration, cell_id, current_record
     Output("saved-concentration-filter", "options"),
     Output("saved-material-filter", "options"),
     Input("database-store", "data"),
+    Input("auth-store", "data"),
     Input("saved-researcher-filter", "value"),
     Input("saved-concentration-filter", "value"),
     Input("saved-material-filter", "value"),
     Input("saved-date-filter", "start_date"),
     Input("saved-date-filter", "end_date"),
 )
-def render_database_summary(database, researcher_filter, concentration_filter, material_filter, start_date, end_date):
+def render_database_summary(database, auth, researcher_filter, concentration_filter, material_filter, start_date, end_date):
     database = database or empty_database()
     cells = database.get("cells", [])
     complete = sum(1 for cell in cells if cell.get("complete_count") == 7)
@@ -1468,7 +2171,7 @@ def render_database_summary(database, researcher_filter, concentration_filter, m
             cell.get("id", "CELDA"), ppm, when,
             "Completada" if is_complete else f"Incompleta {cell.get('complete_count', 0)}/7",
             cell.get("researcher") or "Sin asignar",
-            deletable=True,
+            can_delete=str((auth or {}).get("role") or "visualizador").lower() == "admin",
         ))
     if not recent_children:
         recent_children = [html.Div("No hay celdas guardadas con estos filtros.", className="metric-note")]
@@ -1488,17 +2191,27 @@ def render_database_summary(database, researcher_filter, concentration_filter, m
         for idx, (label, count) in enumerate(sorted(counts.items()))
     ] or [html.Div("Sin datos reales.", className="metric-note")]
 
-    researcher = database.get("current_researcher")
-    initials = "--"
-    if researcher:
-        initials = "".join(part[0] for part in researcher.split()[:2]).upper()
+    auth = auth or {"role": "visualizador"}
+    role = str(auth.get("role") or "visualizador").lower()
+    if role == "investigador":
+        profile_name = auth.get("researcher") or "Investigador SENSA"
+        initials = "".join(part[0] for part in str(profile_name).split()[:2]).upper() or "I"
+        profile_role = "Investigador SENSA"
+    elif role == "admin":
+        profile_name = auth.get("admin_user") or "Administrador"
+        initials = "AD"
+        profile_role = "Administrador SENSA"
+    else:
+        profile_name = "Visualizador"
+        initials = "V"
+        profile_role = "Solo lectura"
     researcher_options = sorted({cell.get("researcher") for cell in cells if cell.get("researcher")})
     concentration_options = [{"label": f"{float(value):g} ppm", "value": value} for value in concentrations]
     material_options = sorted({cell.get("material") for cell in cells if cell.get("material")})
     return (
         len(cells), complete, len(concentrations), concentration_note,
         database.get("reports_generated", 0), recent_children, concentration_children,
-        initials, researcher or "Seleccionar investigador", "Investigador SENSA" if researcher else "SENSA",
+        initials, profile_name, profile_role,
         researcher_options, concentration_options, material_options,
     )
 
@@ -1660,11 +2373,16 @@ def local_analysis(records, composition=None, researcher=None):
     State("initial-volume-ml", "value"), State("copper-stock-ppm", "value"), State("copper-added-ml", "value"),
     State("cell-concentration", "value"),
     State("database-store", "data"),
+    State("draft-mode-store", "data"),
     prevent_initial_call=True,
 )
-def analyze_with_ai(n_clicks, records, electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume, copper_stock, copper_added, final_copper, database):
+def analyze_with_ai(n_clicks, records, electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume, copper_stock, copper_added, final_copper, database, draft_mode):
+    if not can_edit():
+        return no_update, html.Div("Modo visualizador: el análisis no puede regenerarse.", className="upload-error")
+    if not draft_mode:
+        return no_update, html.Div("El análisis de una celda guardada es de solo lectura. Crea una nueva celda para generar otro análisis.", className="upload-error")
     records = records or []
-    researcher = (database or {}).get("current_researcher")
+    researcher = authenticated_researcher_name()
     period = assay_period(records)
     composition = build_composition(electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume, copper_stock, copper_added, final_copper)
     fallback_text, metrics = local_analysis(records, composition, researcher)
@@ -2234,6 +2952,8 @@ No agregues secciones correspondientes a técnicas inexistentes. No menciones ar
     prevent_initial_call=True,
 )
 def save_current_cell(n_clicks, draft_mode, report_ready, records, cell_id, database, material, observations, concentration, analysis, electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume, copper_stock, copper_added, pdf_b64):
+    if not can_edit():
+        return no_update, no_update, html.Div("Modo visualizador: no puedes guardar celdas.", className="upload-error")
     if not draft_mode:
         return no_update, no_update, html.Div("Crea una nueva celda antes de guardar.", className="upload-error")
     complete_count = sum(ok for _, _, ok in protocol_state(records or []))
@@ -2251,9 +2971,9 @@ def save_current_cell(n_clicks, draft_mode, report_ready, records, cell_id, data
     if missing:
         return no_update, no_update, html.Div("Falta: " + ", ".join(missing) + ".", className="upload-error")
     database = database or load_database()
-    researcher = database.get("current_researcher")
+    researcher = authenticated_researcher_name()
     if not researcher:
-        return no_update, no_update, html.Div("Selecciona el investigador responsable.", className="upload-error")
+        return no_update, no_update, html.Div("No hay una sesión de investigador activa.", className="upload-error")
     composition = build_composition(electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume, copper_stock, copper_added, concentration)
     cell = {
         "id": cell_id,
@@ -2293,6 +3013,8 @@ def save_current_cell(n_clicks, draft_mode, report_ready, records, cell_id, data
     prevent_initial_call=True,
 )
 def discard_draft(n_clicks, draft_mode):
+    if not can_edit():
+        return no_update, no_update, no_update, no_update, html.Div("Modo visualizador: no hay acciones de edición disponibles.", className="upload-error")
     if not draft_mode:
         return no_update, no_update, no_update, no_update, html.Div("No hay un borrador activo.", className="upload-error")
     return [], None, False, False, html.Div("Borrador descartado. No se guardó ningún dato.", className="upload-ok")
@@ -2317,12 +3039,18 @@ def discard_draft(n_clicks, draft_mode):
     State("copper-added-ml", "value"),
     State("cell-concentration", "value"),
     State("database-store", "data"),
+    State("draft-mode-store", "data"),
     prevent_initial_call=True,
 )
 def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_cell,
              electrolyte, electrolyte_concentration, electrolyte_unit, initial_volume,
-             copper_stock, copper_added, final_copper, database):
+             copper_stock, copper_added, final_copper, database, draft_mode):
     if not n_clicks:
+        return no_update, no_update, no_update
+    if not can_edit():
+        return no_update, no_update, no_update
+    if not draft_mode:
+        # El PDF oficial de una celda guardada no se regenera ni se sobrescribe.
         return no_update, no_update, no_update
     if not records:
         return no_update, no_update, no_update
@@ -2332,7 +3060,7 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import cm
-    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.5*cm, leftMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
@@ -2347,7 +3075,7 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
         copper_stock, copper_added, final_copper,
     )
     saved_cell = next((cell for cell in (database or {}).get("cells", []) if cell.get("id") == current_cell), None)
-    researcher = (saved_cell or {}).get("researcher") or (database or {}).get("current_researcher") or "No registrado"
+    researcher = (saved_cell or {}).get("researcher") or authenticated_researcher_name() or "No registrado"
     period = assay_period(records)
     def display_number(value, decimals=4):
         try:
@@ -2355,13 +3083,56 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
         except (TypeError, ValueError):
             return "N/D"
 
+    def pdf_markup(value):
+        """Texto seguro para Paragraph y notación Cu2+ sin glifos cuadrados."""
+        from xml.sax.saxutils import escape
+
+        text = escape(str(value))
+        # Helvetica no siempre contiene el glifo Unicode de superíndice +.
+        # ReportLab sí puede representar la carga con la etiqueta <super>.
+        text = text.replace("Cu²⁺", "Cu<super>2+</super>")
+        text = text.replace("Cu²+", "Cu<super>2+</super>")
+        return text
+
+    def pdf_paragraph(value, style=None):
+        return Paragraph(pdf_markup(value), style or styles["BodySmall"])
+
     logo_path = ASSETS / "sensa_logo_header.png"
     if logo_path.exists():
         story.append(Image(str(logo_path), width=5.2*cm, height=3.15*cm))
     story.append(Paragraph("Informe electroquímico SENSA Cells", styles["SensaTitle"]))
     conc = composition.get("final_copper_ppm")
-    story.append(Paragraph(f"Celda: {current_cell or 'Sin identificar'} &nbsp;&nbsp; | &nbsp;&nbsp; Concentración Cu²⁺: {conc if conc is not None else 'No detectada'} ppm", styles["BodySmall"]))
-    story.append(Paragraph(f"Investigador: {researcher} &nbsp;&nbsp; | &nbsp;&nbsp; Fecha del ensayo: {period['date']} &nbsp;&nbsp; | &nbsp;&nbsp; Hora: {period['time']}", styles["BodySmall"]))
+
+    header_data = [
+        [
+            Paragraph("<b>Celda</b>", styles["BodySmall"]),
+            Paragraph("<b>Cu<super>2+</super> final</b>", styles["BodySmall"]),
+            Paragraph("<b>Investigador</b>", styles["BodySmall"]),
+            Paragraph("<b>Fecha y hora del ensayo</b>", styles["BodySmall"]),
+        ],
+        [
+            pdf_paragraph(current_cell or "Sin identificar"),
+            Paragraph(
+                f"{display_number(conc) if conc is not None else 'No detectada'} ppm",
+                styles["BodySmall"],
+            ),
+            pdf_paragraph(researcher),
+            pdf_paragraph(f"{period['date']} | {period['time']}"),
+        ],
+    ]
+    header_table = Table(header_data, colWidths=[3.0*cm, 3.0*cm, 4.0*cm, 5.0*cm])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EAF2FB")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.HexColor(BLUE)),
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(header_table)
     story.append(Spacer(1, 8))
     story.append(Paragraph("Unidades y composición de la celda", styles["Section"]))
     composition_data = [
@@ -2386,10 +3157,35 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     ]))
     story.append(composition_table)
     story.append(Spacer(1, 8))
-    story.append(Paragraph("Objetivo", styles["Section"]))
-    story.append(Paragraph("Documentar la evolución de la celda desde el blanco hasta la respuesta después de añadir cobre, comparando CA, CV y tres LSV consecutivas con métricas trazables.", styles["BodySmall"]))
-    story.append(Paragraph("Alcance", styles["Section"]))
-    story.append(Paragraph("El informe diferencia resultados observados de interpretaciones electroquímicas. Para CV y LSV, los máximos, amplitudes y repetibilidad se calculan exclusivamente en la región Vset de 0.2 a 0.6 V; el CA se analiza contra tiempo.", styles["BodySmall"]))
+    objective_scope_data = [
+        [
+            Paragraph("<b>Objetivo</b>", styles["BodySmall"]),
+            pdf_paragraph(
+                "Documentar la evolución de la celda desde el blanco hasta la respuesta "
+                "después de añadir cobre, comparando CA, CV y tres LSV consecutivas con métricas trazables."
+            ),
+        ],
+        [
+            Paragraph("<b>Alcance</b>", styles["BodySmall"]),
+            pdf_paragraph(
+                "El informe diferencia resultados observados de interpretaciones electroquímicas. "
+                "Para CV y LSV, las métricas analíticas se calculan en Vset = 0.2–0.6 V; "
+                "la CA se analiza contra tiempo."
+            ),
+        ],
+    ]
+    objective_scope_table = Table(objective_scope_data, colWidths=[3.2*cm, 11.8*cm])
+    objective_scope_table.setStyle(TableStyle([
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(objective_scope_table)
 
     states = protocol_state(records or [])
     data = [["Archivo", "Técnica", "Condición", "Puntos", "Filtro"]]
@@ -2411,32 +3207,87 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
     story.append(table)
     story.append(Spacer(1, 10))
     story.append(Paragraph("Control del protocolo", styles["Section"]))
-    protocol_data = [["Etapa", "Estado"]] + [[label, "Completa" if ok else "Faltante"] for label, _, ok in states]
+    protocol_data = [["Etapa", "Estado"]] + [
+        [pdf_paragraph(label), pdf_paragraph("Completa" if ok else "Faltante")]
+        for label, _, ok in states
+    ]
     protocol_table = Table(protocol_data, colWidths=[11*cm, 4*cm])
     protocol_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .4, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 8.5)]))
     story.append(protocol_table)
 
-    # El PDF incorpora únicamente las técnicas que existen en la celda.
+    # Las gráficas del PDF se generan con Matplotlib.
+    # Plotly se conserva únicamente para la interfaz web interactiva.
+    # De esta forma el informe no depende de Kaleido ni de Chrome en Render.
     chart_sections = []
     if any(record.get("technique") == "CA" for record in (records or [])):
-        chart_sections.append(("2. Evolución de las cronoamperometrías", ca_fig))
+        chart_sections.append(("2. Evolución de las cronoamperometrías", "ca"))
     if any(record.get("technique") == "CV" for record in (records or [])):
-        chart_sections.append(("3. Evolución de las voltametrías cíclicas", cv_fig))
+        chart_sections.append(("3. Evolución de las voltametrías cíclicas", "cv"))
     lsv_count = sum(record.get("technique") == "LSV" for record in (records or []))
     if lsv_count:
-        chart_sections.append(("4. Voltametrías de barrido lineal", lsv_fig))
+        chart_sections.append(("4. Voltametrías de barrido lineal", "lsv"))
     if lsv_count >= 2:
-        chart_sections.append(("5. Promedio y repetibilidad de las LSV", make_lsv_mean_figure(records or []).to_dict()))
-    for title, fig_dict in chart_sections:
+        chart_sections.append(("5. Promedio y repetibilidad de las LSV", "lsv_mean"))
+    if any(record.get("technique") in ("CV", "LSV") for record in (records or [])):
+        chart_sections.append(("6. Evolución general de la celda — Vset 0,0 a 0,6 V", "general"))
+
+    for title, chart_kind in chart_sections:
         story.append(Spacer(1, 8))
         story.append(Paragraph(title, styles["Section"]))
         try:
-            fig = go.Figure(fig_dict)
-            png = fig.to_image(format="png", width=950, height=410, scale=1.2)
-            img_buf = io.BytesIO(png)
-            story.append(Image(img_buf, width=15.9*cm, height=6.45*cm))
-        except Exception:
-            story.append(Paragraph("La gráfica no pudo incorporarse. Instala o actualiza Kaleido para exportar figuras Plotly.", styles["BodySmall"]))
+            img_buf = make_pdf_chart_png(records or [], chart_kind)
+            chart_image = Image(img_buf, width=15.5*cm, height=6.25*cm)
+            chart_box = Table([[chart_image]], colWidths=[16.1*cm])
+            chart_box.setStyle(TableStyle([
+                ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#CBD5E1")),
+                ("BACKGROUND", (0,0), (-1,-1), colors.white),
+                ("LEFTPADDING", (0,0), (-1,-1), 8),
+                ("RIGHTPADDING", (0,0), (-1,-1), 8),
+                ("TOPPADDING", (0,0), (-1,-1), 8),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ]))
+            story.append(chart_box)
+
+            if chart_kind == "general":
+                evolution_data = [
+                    [Paragraph("<b>Ventana comparada</b>", styles["BodySmall"]), pdf_paragraph("Vset 0.0–0.6 V")],
+                    [
+                        Paragraph("<b>Señales incluidas</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "CV Blanco, CV Cu<super>2+</super>, LSV 1, LSV 2, LSV 3 y promedio LSV",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                    [Paragraph("<b>Señal no incluida</b>", styles["BodySmall"]), pdf_paragraph("CA, porque se interpreta contra tiempo (s).")],
+                    [
+                        Paragraph("<b>Objetivo de la figura</b>", styles["BodySmall"]),
+                        Paragraph(
+                            "Comparar en una misma ventana la evolución voltamétrica desde el blanco "
+                            "hasta los barridos consecutivos posteriores a la adición de Cu<super>2+</super>.",
+                            styles["BodySmall"],
+                        ),
+                    ],
+                ]
+                evolution_table = Table(evolution_data, colWidths=[4.1*cm, 12.0*cm])
+                evolution_table.setStyle(TableStyle([
+                    ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+                    ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+                    ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 7),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 7),
+                    ("TOPPADDING", (0,0), (-1,-1), 6),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+                ]))
+                story.append(Spacer(1, 6))
+                story.append(evolution_table)
+
+        except Exception as exc:
+            story.append(Paragraph(
+                "La gráfica no pudo incorporarse con Matplotlib. "
+                f"Detalle técnico: {pdf_markup(exc)}",
+                styles["BodySmall"],
+            ))
 
         relevant = []
         title_lower = title.lower()
@@ -2449,32 +3300,95 @@ def make_pdf(n_clicks, records, analysis_text, ca_fig, lsv_fig, cv_fig, current_
             metric_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor(BLUE)), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .35, colors.HexColor(BORDER)), ("FONTSIZE", (0,0), (-1,-1), 7.7), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")])]))
             story.append(Spacer(1, 8)); story.append(metric_table)
 
-    # El PDF utiliza el mismo análisis mostrado en pantalla, generado por Gemini
-    # y almacenado en analysis-store. El análisis local se conserva únicamente
-    # como respaldo si todavía no existe una respuesta de IA.
+    # El PDF utiliza el mismo análisis mostrado en pantalla.
+    # Se identifica de forma trazable si proviene de Gemini o del análisis local SENSA.
+    analysis_provider = "Análisis local SENSA"
+    analysis_method = "Procesamiento local basado en métricas calculadas por SENSA"
+
     if not analysis_text or not str(analysis_text).strip():
         analysis_text, _ = local_analysis(records or [], composition, researcher)
+    else:
+        analysis_text = str(analysis_text)
+        if "La llamada de IA no pudo completarse:" in analysis_text:
+            # Si Gemini falló, el PDF no incorpora el detalle técnico de la API.
+            analysis_text = analysis_text.split("\n\n> La llamada de IA no pudo completarse:", 1)[0].strip()
+            analysis_provider = "Análisis local SENSA"
+            analysis_method = "Respaldo local utilizado por indisponibilidad del servicio de IA"
+        elif os.getenv("GEMINI_API_KEY"):
+            analysis_provider = "Gemini"
+            analysis_method = "Análisis electroquímico asistido por inteligencia artificial"
+        elif os.getenv("OPENAI_API_KEY"):
+            analysis_provider = "OpenAI"
+            analysis_method = "Análisis electroquímico asistido por inteligencia artificial"
+
+    # El análisis electroquímico comienza siempre en una página nueva.
+    story.append(PageBreak())
+    story.append(Paragraph("Análisis electroquímico", styles["SensaTitle"]))
+
+    analysis_meta = Table(
+        [
+            [
+                Paragraph("<b>Método de análisis</b>", styles["BodySmall"]),
+                pdf_paragraph(analysis_method),
+            ],
+            [
+                Paragraph("<b>Proveedor / motor</b>", styles["BodySmall"]),
+                pdf_paragraph(analysis_provider),
+            ],
+            [
+                Paragraph("<b>Base del análisis</b>", styles["BodySmall"]),
+                pdf_paragraph("Archivos experimentales y métricas calculadas por SENSA"),
+            ],
+        ],
+        colWidths=[4.2*cm, 11.8*cm],
+    )
+    analysis_meta.setStyle(TableStyle([
+        ("BOX", (0,0), (-1,-1), 0.6, colors.HexColor(BORDER)),
+        ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor(BORDER)),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(analysis_meta)
     story.append(Spacer(1, 10))
-    story.append(Paragraph("Análisis electroquímico", styles["Section"]))
+
     for raw_line in str(analysis_text).splitlines():
         line = raw_line.strip()
         if not line:
             story.append(Spacer(1, 4)); continue
-        clean = line.replace("**", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        if clean.startswith("###"):
-            story.append(Paragraph(clean.lstrip("# "), styles["Section"]))
-        elif clean.startswith("##"):
+        clean_raw = line.replace("**", "")
+        if clean_raw.startswith("###"):
+            story.append(Paragraph(pdf_markup(clean_raw.lstrip("# ")), styles["Section"]))
+        elif clean_raw.startswith("##"):
             continue
-        elif clean.startswith("- "):
-            story.append(Paragraph("• " + clean[2:], styles["BodySmall"]))
+        elif clean_raw.startswith("- "):
+            story.append(Paragraph("• " + pdf_markup(clean_raw[2:]), styles["BodySmall"]))
         else:
-            story.append(Paragraph(clean, styles["BodySmall"]))
+            story.append(Paragraph(pdf_markup(clean_raw), styles["BodySmall"]))
 
-    doc.build(story)
-    buffer.seek(0)
-    filename = f"SENSA_Informe_{current_cell or 'Celda'}.pdf"
-    pdf_bytes = buffer.getvalue()
-    return dcc.send_bytes(pdf_bytes, filename), True, base64.b64encode(pdf_bytes).decode("ascii")
+    try:
+        doc.build(story)
+        buffer.seek(0)
+        filename = f"SENSA_Informe_{current_cell or 'Celda'}.pdf"
+        pdf_bytes = buffer.getvalue()
+
+        # Payload explícito para dcc.Download. Así el callback siempre devuelve
+        # exactamente los tres valores que Dash espera.
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+        download_payload = {
+            "content": pdf_b64,
+            "filename": filename,
+            "type": "application/pdf",
+            "base64": True,
+        }
+        print(f"[SENSA PDF] Informe generado correctamente: {filename} ({len(pdf_bytes)} bytes)", flush=True)
+        return download_payload, True, pdf_b64
+    except Exception as exc:
+        print(f"[SENSA PDF ERROR] {type(exc).__name__}: {exc}", flush=True)
+        return no_update, False, no_update
 
 
 if __name__ == "__main__":
